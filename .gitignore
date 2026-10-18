@@ -1,0 +1,10 @@
+build/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.pdb
+*.ilk
+*.obj
+*.exp
+*.lib
