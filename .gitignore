@@ -8,3 +8,6 @@ build/
 *.obj
 *.exp
 *.lib
+
+tests/
+bench/
