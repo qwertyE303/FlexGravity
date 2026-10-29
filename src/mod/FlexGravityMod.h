@@ -84,18 +84,25 @@ using core::Subtract;
 
 using core::ArrayScan;
 using core::BodySamples;
+using core::CFieldRow;
+using core::CRegionRow;
 using core::GroupScan;
-using core::RRowInfo;
+using core::LocalRow;
+using core::RegionMember;
 using core::RegionVolume;
 using core::ScanInfo;
 using core::SourceInfo;
+using core::SourceRef;
 using core::UFieldInfo;
 
-using fg::core::expr::CustomFieldInfo;
+using fg::core::expr::CompileError;
 using fg::core::expr::PointFrame;
 
 using fg::vt::ArrayTypeName;
 using fg::vt::ClassText;
+using fg::vt::DisplayName;
+using fg::vt::DisplayObjectName;
+using fg::vt::HasPlaceholderPrefix;
 using fg::vt::IdText;
 using fg::vt::ObjectText;
 using fg::vt::SafeCurveCast;
@@ -105,21 +112,23 @@ using fg::vt::SafeCurvePointCount;
 using fg::vt::SafeName;
 using fg::vt::SafeWorldPosition;
 
-constexpr const char *kGroupU = "FG_U";
-constexpr const char *kGroupM = "FG_M";
-constexpr const char *kGroupL = "FG_L";
-constexpr const char *kGroupS = "FG_S";
-constexpr const char *kGroupR = "FG_R";
+constexpr const char *kGroupU = "FG_UField";
+constexpr const char *kGroupM = "FG_MField";
+constexpr const char *kGroupL = "FG_LField";
+constexpr const char *kGroupS = "FG_SField";
+constexpr const char *kGroupRegion = "FG_Region";
+constexpr const char *kGroupCField = "FG_CField";
+constexpr const char *kGroupCRegion = "FG_CRegion";
 
-constexpr const char *kArrayU = "FG_U";
-constexpr const char *kArrayM = "FG_M";
-constexpr const char *kArrayL = "FG_L";
-constexpr const char *kArrayS = "FG_S";
-constexpr const char *kArrayR = "FG_R";
-constexpr const char *kArrayRG = "FG_RG";
-// FG_Custom has no group and no object column: it is a pure data array whose
-// Domain is the only activation rule.
-constexpr const char *kArrayCustom = "FG_Custom";
+constexpr const char *kArrayU = "FG_UField";
+constexpr const char *kArrayM = "FG_MField";
+constexpr const char *kArrayL = "FG_LField";
+constexpr const char *kArrayS = "FG_SField";
+constexpr const char *kArrayCField = "FG_CField";
+constexpr const char *kArrayCRegion = "FG_CRegion";
+// FG_Local / FG_Global are the only pure-array pairing tables: no group.
+constexpr const char *kArrayLocal = "FG_Local";
+constexpr const char *kArrayGlobal = "FG_Global";
 
 // ---------------------------------------------------------------------------
 // Runtime state
@@ -195,7 +204,6 @@ public:
 
     void OnProcess() override;
     void OnModifyConfig(const char *category, const char *key, IProperty *prop) override;
-    void OnRender(CK_RENDER_FLAGS flags) override;
 
     void OnPhysicalize(CK3dEntity *target, CKBOOL fixed, float friction, float elasticity, float mass,
                        const char *collGroup, CKBOOL startFrozen, CKBOOL enableColl, CKBOOL calcMassCenter,
@@ -234,6 +242,14 @@ public:
     // SampleFieldAtPoint, which is what the equipotential overlay relies on.
     float PotentialAtPoint(const VxVector &worldPoint);
 
+    // `fg debug freemode`: on/off for the player's ball only.  Persists across
+    // levels and respawns until the process restarts.
+    // freemode: cancel every gravity source for the active ball only, by
+    // applying the exact opposite of the engine's fixed gravity as a force.
+    // Route C: no physics-RT ABI is touched; the engine gravity stays -20.
+    void SetFreeMode(IBML *bml, bool enable);
+    bool FreeModeEnabled() const { return m_FreeMode; }
+
     bool IsDebugMode() const { return m_DebugMode; }
 
     // Detailed logging needs both switches: DebugMode is the master switch for
@@ -255,6 +271,9 @@ private:
 
     void LogInfo(const char *fmt, ...);
     void LogWarn(const char *fmt, ...);
+    // Writes even when DebugMode/EnableLog are off.  Used only for one-shot
+    // "the feature cannot work at all" diagnostics.
+    void LogAlways(const char *fmt, ...);
     void Warn(const std::string &message);
     void SendMessage(const std::string &message);
 
@@ -274,16 +293,23 @@ private:
     void ScanUArray(const std::unordered_map<CK_ID, std::string> &groupMembers);
     void ScanSourceArray(SourceInfo::Kind kind, const char *arrayName, const char *strengthColumn,
                          ArrayScan &arrayScan, const std::unordered_map<CK_ID, std::string> &groupMembers);
-    void ScanRArray(const std::unordered_map<CK_ID, std::string> &groupMembers);
-    void ScanRGArray();
-    void ScanCustomArray();
+    void ScanRegionGroup(const std::unordered_map<CK_ID, std::string> &groupMembers);
+    void ScanCFieldArray(const std::unordered_map<CK_ID, std::string> &groupMembers);
+    void ScanCRegionArray(const std::unordered_map<CK_ID, std::string> &groupMembers);
+    void ScanLocalArray(const std::unordered_map<CK_ID, int> &regionIndex,
+                        const std::unordered_map<CK_ID, int> &cRegionIndex,
+                        const std::unordered_map<CK_ID, int> &sourceIndex,
+                        const std::unordered_map<CK_ID, int> &cFieldIndex,
+                        const std::unordered_set<CK_ID> &uObjects);
+    void ScanGlobalArray(const std::unordered_map<CK_ID, int> &sourceIndex,
+                         const std::unordered_map<CK_ID, int> &cFieldIndex,
+                         const std::unordered_set<CK_ID> &uObjects);
     void ValidateMembership(const std::unordered_map<CK_ID, std::string> &uGroupMembers,
                             const std::unordered_map<CK_ID, std::string> &mGroupMembers,
                             const std::unordered_map<CK_ID, std::string> &lGroupMembers,
                             const std::unordered_map<CK_ID, std::string> &sGroupMembers,
-                            const std::unordered_map<CK_ID, std::string> &rGroupMembers);
-
-    const SourceInfo *FindSource(CK_ID objectId) const;
+                            const std::unordered_map<CK_ID, std::string> &cFieldGroupMembers,
+                            const std::unordered_map<CK_ID, std::string> &cRegionGroupMembers);
 
     CK3dEntity *FindActiveBall();
     CK3dEntity *ResolveEntity(CK_ID objectId);
@@ -299,30 +325,31 @@ private:
     bool ObjectTouchesRegion(const RegionVolume &region, const VxMatrix &inverseWorld,
                              const BodySamples &objectSamples);
     // Linear-scan variant used by the reports only, not by the per-frame path.
-    bool IsSourceActive(CK_ID objectId, const std::vector<char> &rowTouched) const;
     VxVector ComputeSourceAcceleration(const SourceInfo &source, const VxVector &center);
     void UpdateFields();
 
     // Shared by UpdateFields and SampleFieldAtPoint: the acceleration that every
-    // active field produces at one point (FG_RG, FG_R rows that contain the
-    // point, and the FG_Custom rows whose Domain holds).  `rowTouched` and
-    // `sourceMask` are caller-owned scratch buffers, already sized to
-    // rRows.size() and sources.size().
+    // active field produces at one point.  A source contributes when it is
+    // listed in FG_Global, or in an FG_Local row whose region contains the
+    // point.  `rowTouched`, `sourceMask` and `cFieldMask` are caller-owned
+    // scratch buffers, already sized to localRows / sources / cFields.
     VxVector EvaluateActiveFieldsAtPoint(const VxVector &point, std::vector<char> &rowTouched,
-                                         std::vector<char> &sourceMask);
-    // FG_Custom only: no object caches involved, so a custom-only level works
-    // even before the first physics step has built anything.
-    VxVector EvaluateCustomFieldsAtPoint(const VxVector &point);
+                                         std::vector<char> &sourceMask,
+                                         std::vector<char> &cFieldMask);
     // Same rule for the scalar potential, for the equipotential overlay.
+    // CFields are deliberately excluded: an arbitrary expression field has no
+    // potential in general.
     float EvaluateSourcePotentialsAtPoint(const VxVector &point, std::vector<char> &rowTouched,
-                                          std::vector<char> &sourceMask);
+                                          std::vector<char> &sourceMask,
+                                          std::vector<char> &cFieldMask);
     bool PointInsideRegion(const RegionVolume &region, const VxMatrix &inverseWorld,
                            const VxVector &worldPoint);
 
-    // Debug overlay (viz/Overlay.cpp).
+    // Debug overlay (viz/Overlay.cpp).  BML 0.3.13 ends the ImGui frame before
+    // OnRender, so the overlay is drawn from OnProcess, inside the frame.
+    void DrawOverlayFrame();
     void DrawOverlay();
     void DrawGravityArrow(ImDrawList *draw, CKRenderContext *renderContext);
-    void DrawOverlayStatus(ImDrawList *draw, CKRenderContext *renderContext);
     float BallRadiusFor(CK3dEntity *ball);
     bool ProjectToScreen(CKRenderContext *renderContext, const VxVector &localPoint,
                          CK3dEntity *reference, VxVector &screenPoint);
@@ -427,9 +454,13 @@ private:
     bool m_DebugMode = false;
     bool m_EnableLog = false;
 
-    // Two warn-once flags per FG_Custom row (Domain NaN, component NaN).  The
-    // hot path never grows the log without this.
+    // One warn-once flag per FG_CField row (component NaN).  The hot path never
+    // grows the log without this.
     std::vector<char> m_CustomWarned;
+
+    // freemode state.  It survives level changes and respawns for the whole
+    // process; only a new game start resets it.
+    bool m_FreeMode = false;
 
     std::unordered_map<CK_ID, BodyInfo> m_Bodies;
 
@@ -453,6 +484,8 @@ private:
 
     // Per-evaluation caches: refreshed once per UpdateFields call, never
     // per body, and never during script execution.
+    std::vector<VxMatrix> m_UFieldInverse;
+    std::vector<char> m_UFieldValid;
     std::vector<VxMatrix> m_RegionInverse;
     std::vector<char> m_RegionValid;
     std::vector<VxMatrix> m_SourceWorld;
@@ -462,7 +495,9 @@ private:
     std::vector<std::vector<VxVector>> m_SourceLines;
     std::vector<SheetWorldCache> m_SourceSheets;
     std::unordered_map<CK_ID, size_t> m_SourceIndex;
+    std::unordered_map<CK_ID, size_t> m_CFieldIndex;
     std::vector<char> m_ActiveSources;
+    std::vector<char> m_ActiveCFields;
 
     // Debug overlay.  Every switch is off by default; with everything off the
     // overlay costs one comparison per frame.
@@ -476,6 +511,7 @@ private:
     // Scratch reused by SampleFieldAtPoint so sampling a point allocates nothing.
     std::vector<char> m_VizRows;
     std::vector<char> m_VizSources;
+    std::vector<char> m_VizCFields;
 
     // Overlay diagnostics, filled by the last rendered frame and printed on
     // demand by `fg debug viz` (nothing is logged unless asked for).
@@ -484,6 +520,14 @@ private:
     int m_OverlayNoBall = 0;
     int m_OverlayNoProjection = 0;
     int m_OverlayHidden = 0;
+    // Gate counters for the "switch is on but nothing appears" case: the
+    // overlay can be skipped before DrawOverlay for several distinct reasons.
+    int m_OverlayPaused = 0;
+    int m_OverlayNoContext = 0;
+    int m_OverlayGateFrames = 0;
+    bool m_OverlayGateWarned = false;
+    bool m_OverlayDrawWarned = false;
+    int m_OverlayProcessFrames = 0;
     int m_OverlaySpanCount = 0;
     float m_OverlayVisibleMetres = 0.0f;
     bool m_OverlayHadFrame = false;

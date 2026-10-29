@@ -1,5 +1,40 @@
 #include "mod/FlexGravityMod.h"
 
+namespace {
+
+const char *RelOpText(core::expr::RelOp op) {
+    switch (op) {
+    case core::expr::RelOp::Equal:
+        return "=";
+    case core::expr::RelOp::NotEqual:
+        return "!=";
+    case core::expr::RelOp::Less:
+        return "<";
+    case core::expr::RelOp::LessEqual:
+        return "<=";
+    case core::expr::RelOp::Greater:
+        return ">";
+    case core::expr::RelOp::GreaterEqual:
+        return ">=";
+    }
+    return "?";
+}
+
+bool RefsContain(const std::vector<SourceRef> &refs, SourceRef::Kind kind, int index) {
+    for (const SourceRef &ref : refs) {
+        if (ref.kind == kind && ref.index == index) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const char *RegionKindText(const LocalRow &row) {
+    return row.regionKind == LocalRow::BuiltinRegion ? "region" : "cregion";
+}
+
+} // namespace
+
 void FlexGravityMod::PrintFieldStatus(IBML *bml) {
     (void) bml;
     if (!m_Scan.ran) {
@@ -16,32 +51,56 @@ void FlexGravityMod::PrintFieldStatus(IBML *bml) {
     const BodySamples ballSamples = BuildBodySamples(ball->GetWorldMatrix());
     const VxVector center = ballSamples.Center();
 
-    std::vector<char> rowTouched(m_Scan.rRows.size(), 0);
-    for (size_t index = 0; index < m_Scan.rRows.size(); ++index) {
-        const RRowInfo &rRow = m_Scan.rRows[index];
-        rowTouched[index] = ObjectTouchesRegion(rRow.region, rRow.regionObjectId, ballSamples) ? 1 : 0;
-    }
-
-    VxVector total(0.0f, 0.0f, 0.0f);
     LogInfo("Field status for %s center=%s", SafeName(ball).c_str(), FormatVec(center).c_str());
 
-    for (const UFieldInfo &field : m_Scan.uFields) {
-        const bool ballTouches = ObjectTouchesRegion(field.region, field.objectId, ballSamples);
-        if (ballTouches) {
-            total = Add(total, field.gravity);
+    VxVector total(0.0f, 0.0f, 0.0f);
+    for (size_t index = 0; index < m_Scan.uFields.size(); ++index) {
+        const bool touches = ObjectTouchesRegion(m_Scan.uFields[index].region,
+                                                 m_Scan.uFields[index].objectId, ballSamples);
+        if (touches) {
+            total = Add(total, m_Scan.uFields[index].gravity);
         }
-        LogInfo("  U[%s] touch=%s g=(%.4f, %.4f, %.4f)", field.objectName.c_str(),
-                BoolText(ballTouches).c_str(), field.gravity.x, field.gravity.y, field.gravity.z);
+        LogInfo("  U[%s] touch=%s g=(%.4f, %.4f, %.4f)", m_Scan.uFields[index].objectName.c_str(),
+                BoolText(touches).c_str(), m_Scan.uFields[index].gravity.x,
+                m_Scan.uFields[index].gravity.y, m_Scan.uFields[index].gravity.z);
     }
 
-    for (const RRowInfo &rRow : m_Scan.rRows) {
-        LogInfo("  R[%s] ballInside=%s sources=%zu", rRow.regionName.c_str(),
-                BoolText(ObjectTouchesRegion(rRow.region, rRow.regionObjectId, ballSamples)).c_str(),
-                rRow.sourceIds.size());
+    std::vector<char> rowTouched(m_Scan.localRows.size(), 0);
+    std::vector<char> sourceMask(m_Scan.sources.size(), 0);
+    std::vector<char> cFieldMask(m_Scan.cFields.size(), 0);
+    const VxVector active = EvaluateActiveFieldsAtPoint(center, rowTouched, sourceMask, cFieldMask);
+    total = Add(total, active);
+
+    for (size_t index = 0; index < m_Scan.localRows.size(); ++index) {
+        const LocalRow &row = m_Scan.localRows[index];
+        std::string regionName = "<unknown>";
+        if (row.regionKind == LocalRow::BuiltinRegion && row.regionIndex >= 0 &&
+            row.regionIndex < static_cast<int>(m_Scan.regions.size())) {
+            regionName = m_Scan.regions[static_cast<size_t>(row.regionIndex)].objectName;
+        } else if (row.cRegionIndex >= 0 &&
+                   row.cRegionIndex < static_cast<int>(m_Scan.cRegions.size())) {
+            regionName = m_Scan.cRegions[static_cast<size_t>(row.cRegionIndex)].displayName;
+        }
+        LogInfo("  L[%s] kind=%s ballInside=%s sources=%zu", regionName.c_str(),
+                RegionKindText(row), BoolText(rowTouched[index] != 0).c_str(),
+                row.sources.size());
     }
 
-    for (const SourceInfo &source : m_Scan.sources) {
-        const bool active = IsSourceActive(source.objectId, rowTouched);
+    for (size_t index = 0; index < m_Scan.sources.size(); ++index) {
+        const SourceInfo &source = m_Scan.sources[index];
+        const bool activeSource = index < sourceMask.size() && sourceMask[index] != 0;
+        const bool global = RefsContain(m_Scan.globalSources, SourceRef::Builtin,
+                                        static_cast<int>(index));
+        bool local = false;
+        for (size_t row = 0; row < rowTouched.size(); ++row) {
+            if (rowTouched[row] && RefsContain(m_Scan.localRows[row].sources, SourceRef::Builtin,
+                                               static_cast<int>(index))) {
+                local = true;
+                break;
+            }
+        }
+        const char *scope = global && local ? "local+global" : (global ? "global" : (local ? "local" : "-"));
+
         VxVector contribution(0.0f, 0.0f, 0.0f);
         std::string detail;
         if (source.kind == SourceInfo::KindMonopole) {
@@ -69,8 +128,6 @@ void FlexGravityMod::PrintFieldStatus(IBML *bml) {
             if (entity) {
                 const VxMatrix &world = entity->GetWorldMatrix();
                 if (source.SheetPatchCount() > 0) {
-                    // Distance to the nearest patch plane: the sheet's own
-                    // "am I near the surface" number, now over every patch.
                     float nearest = 1.0e30f;
                     for (int patch = 0; patch < source.SheetPatchCount(); ++patch) {
                         const int begin = source.sheetOffsets[patch];
@@ -91,48 +148,66 @@ void FlexGravityMod::PrintFieldStatus(IBML *bml) {
                     Normalize(axisB, axisB);
                     VxVector normal(0.0f, 0.0f, 0.0f);
                     Normalize(Cross(axisA, axisB), normal);
-                    detail = " z=" + std::to_string(
-                            std::fabs(Dot(Subtract(center, origin), normal)));
+                    detail = " z=" + std::to_string(std::fabs(Dot(Subtract(center, origin), normal)));
                 }
             }
             contribution = ComputeSourceAcceleration(source, center);
         }
-        if (active) {
-            total = Add(total, contribution);
-        }
-        LogInfo("  %s[%s] strength=%.4f active=%s%s g=(%.4f, %.4f, %.4f)",
+        LogInfo("  %s[%s] strength=%.4f active=%s scope=%s%s g=(%.4f, %.4f, %.4f)",
                 SourceKindName(source.kind), source.objectName.c_str(), source.strength,
-                BoolText(active).c_str(), detail.c_str(),
-                contribution.x, contribution.y, contribution.z);
+                BoolText(activeSource).c_str(), scope, detail.c_str(), contribution.x,
+                contribution.y, contribution.z);
     }
 
-    const PointFrame frame = core::expr::MakePointFrame(center);
-    for (size_t index = 0; index < m_Scan.customFields.size(); ++index) {
-        const CustomFieldInfo &field = m_Scan.customFields[index];
-        if (!field.valid) {
-            LogInfo("  C[%zu] \"%s\" rejected: %s", index, field.name.c_str(), field.error.c_str());
-            continue;
+    if (!m_Scan.cFields.empty()) {
+        const PointFrame frame = core::expr::MakePointFrame(center);
+        for (size_t index = 0; index < m_Scan.cFields.size(); ++index) {
+            const CFieldRow &field = m_Scan.cFields[index];
+            const bool activeField = index < cFieldMask.size() && cFieldMask[index] != 0;
+            const bool global =
+                    RefsContain(m_Scan.globalSources, SourceRef::Custom, static_cast<int>(index));
+            bool local = false;
+            for (size_t row = 0; row < rowTouched.size(); ++row) {
+                if (rowTouched[row] &&
+                    RefsContain(m_Scan.localRows[row].sources, SourceRef::Custom,
+                                static_cast<int>(index))) {
+                    local = true;
+                    break;
+                }
+            }
+            const char *scope =
+                    global && local ? "local+global" : (global ? "global" : (local ? "local" : "-"));
+            VxVector contribution(0.0f, 0.0f, 0.0f);
+            if (activeField && field.compiled.valid) {
+                bool nonFinite = false;
+                contribution = core::expr::EvaluateCField(field.compiled, frame, &nonFinite);
+            }
+            LogInfo("  C[%s] mode=%d active=%s scope=%s g=(%.4f, %.4f, %.4f)",
+                    field.displayName.c_str(), field.compiled.mode, BoolText(activeField).c_str(),
+                    scope, contribution.x, contribution.y, contribution.z);
         }
-        bool nonFinite = false;
-        const bool active = core::expr::EvaluateCustomDomain(field, frame, &nonFinite);
-        VxVector contribution(0.0f, 0.0f, 0.0f);
-        if (active) {
-            contribution = core::expr::EvaluateCustomComponents(field, frame, &nonFinite);
-            total = Add(total, contribution);
-        }
-        LogInfo("  C[%zu] \"%s\" mode=%d domain=\"%s\" active=%s g=(%.4f, %.4f, %.4f)", index,
-                field.name.c_str(), field.mode, field.domainText.c_str(), BoolText(active).c_str(),
-                contribution.x, contribution.y, contribution.z);
     }
 
     const std::string message =
-            "sources=" + std::to_string(m_Scan.sources.size()) +
-            " R rows=" + std::to_string(m_Scan.rRows.size()) +
-            " global=" + std::to_string(m_Scan.globalSourceIds.size()) +
-            " custom=" + std::to_string(m_Scan.customFields.size()) +
+            "U=" + std::to_string(m_Scan.uFields.size()) +
+            " M=" + std::to_string(static_cast<size_t>(std::count_if(
+                              m_Scan.sources.begin(), m_Scan.sources.end(),
+                              [](const SourceInfo &s) { return s.kind == SourceInfo::KindMonopole; }))) +
+            " L=" + std::to_string(static_cast<size_t>(std::count_if(
+                              m_Scan.sources.begin(), m_Scan.sources.end(),
+                              [](const SourceInfo &s) { return s.kind == SourceInfo::KindLine; }))) +
+            " S=" + std::to_string(static_cast<size_t>(std::count_if(
+                              m_Scan.sources.begin(), m_Scan.sources.end(),
+                              [](const SourceInfo &s) { return s.kind == SourceInfo::KindSheet; }))) +
+            " regions=" + std::to_string(m_Scan.regions.size()) +
+            " localRows=" + std::to_string(m_Scan.localRows.size()) +
+            " global=" + std::to_string(m_Scan.globalSources.size()) +
+            " cfields=" + std::to_string(m_Scan.cFields.size()) +
+            " cregions=" + std::to_string(m_Scan.cRegions.size()) +
             " total=" + FormatVec(total) +
             " channels=" + std::to_string(m_ForceChannels.size()) +
-            " affected=" + std::to_string(m_LastAffectedCount);
+            " affected=" + std::to_string(m_LastAffectedCount) +
+            " freemode=" + std::string(m_FreeMode ? "on" : "off");
     SendMessage(message);
     LogInfo("%s", message.c_str());
 }
@@ -154,28 +229,37 @@ void FlexGravityMod::PrintStatus(IBML *bml) {
             m_Scan.sources.begin(), m_Scan.sources.end(),
             [](const SourceInfo &s) { return s.kind == SourceInfo::KindSheet; }));
 
-    const size_t validCustom = static_cast<size_t>(std::count_if(
-            m_Scan.customFields.begin(), m_Scan.customFields.end(),
-            [](const CustomFieldInfo &field) { return field.valid; }));
-    const size_t rejectedCustom = m_Scan.customFields.size() - validCustom;
+    const size_t validCField = static_cast<size_t>(std::count_if(
+            m_Scan.cFields.begin(), m_Scan.cFields.end(),
+            [](const CFieldRow &field) { return field.compiled.valid; }));
+    const size_t rejectedCField = m_Scan.cFields.size() - validCField;
+    const size_t validCRegion = static_cast<size_t>(std::count_if(
+            m_Scan.cRegions.begin(), m_Scan.cRegions.end(),
+            [](const CRegionRow &region) { return region.valid; }));
 
     const std::string summary =
-            "status: U(group=" + BoolText(m_Scan.uGroup.present) +
+            "status: UField(group=" + BoolText(m_Scan.uGroup.present) +
             ", fields=" + std::to_string(m_Scan.uFields.size()) +
-            ") M(group=" + BoolText(m_Scan.mGroup.present) +
+            ") MField(group=" + BoolText(m_Scan.mGroup.present) +
             ", sources=" + std::to_string(mCount) +
-            ") L(group=" + BoolText(m_Scan.lGroup.present) +
+            ") LField(group=" + BoolText(m_Scan.lGroup.present) +
             ", sources=" + std::to_string(lCount) +
-            ") S(group=" + BoolText(m_Scan.sGroup.present) +
+            ") SField(group=" + BoolText(m_Scan.sGroup.present) +
             ", sources=" + std::to_string(sCount) +
-            ") R(group=" + BoolText(m_Scan.rGroup.present) +
-            ", rows=" + std::to_string(m_Scan.rRows.size()) +
-            ") RG(global=" + std::to_string(m_Scan.globalSourceIds.size()) +
-            ") Custom(rows=" + std::to_string(m_Scan.customFields.size()) +
-            ", valid=" + std::to_string(validCustom) +
-            ", rejected=" + std::to_string(rejectedCustom) +
+            ") Region(group=" + BoolText(m_Scan.regionGroup.present) +
+            ", members=" + std::to_string(m_Scan.regions.size()) +
+            ") CField(group=" + BoolText(m_Scan.cFieldGroup.present) +
+            ", rows=" + std::to_string(m_Scan.cFields.size()) +
+            ", valid=" + std::to_string(validCField) +
+            ") CRegion(group=" + BoolText(m_Scan.cRegionGroup.present) +
+            ", rows=" + std::to_string(m_Scan.cRegions.size()) +
+            ", valid=" + std::to_string(validCRegion) +
+            ") Local(rows=" + std::to_string(m_Scan.localRows.size()) +
+            ") Global(sources=" + std::to_string(m_Scan.globalSources.size()) +
             ") ignored=" + std::to_string(m_Scan.ignoredEntries) +
-            " warnings=" + std::to_string(m_Scan.warnings.size());
+            " warnings=" + std::to_string(m_Scan.warnings.size()) +
+            " cfieldRejected=" + std::to_string(rejectedCField) +
+            " freemode=" + std::string(m_FreeMode ? "on" : "off");
 
     SendMessage(summary);
     LogInfo("%s", summary.c_str());
@@ -192,85 +276,103 @@ void FlexGravityMod::PrintList(IBML *bml) {
         return;
     }
 
-    LogInfo("--- FlexGravity parsed data ---");
+    LogInfo("--- FlexGravity parsed data (v2.1) ---");
     LogInfo("U fields: %zu", m_Scan.uFields.size());
     for (size_t index = 0; index < m_Scan.uFields.size(); ++index) {
         const UFieldInfo &field = m_Scan.uFields[index];
-        LogInfo("  U[%zu] %s (id=%lu) g=(%.4f, %.4f, %.4f)",
-                index, field.objectName.c_str(),
-                static_cast<unsigned long>(field.objectId),
-                field.gravity.x, field.gravity.y, field.gravity.z);
+        LogInfo("  U[%zu] %s (id=%lu) g=(%.4f, %.4f, %.4f)", index, field.objectName.c_str(),
+                static_cast<unsigned long>(field.objectId), field.gravity.x, field.gravity.y,
+                field.gravity.z);
     }
 
     LogInfo("Sources: %zu", m_Scan.sources.size());
     for (size_t index = 0; index < m_Scan.sources.size(); ++index) {
         const SourceInfo &source = m_Scan.sources[index];
         if (source.kind == SourceInfo::KindLine) {
-            LogInfo("  L[%zu] %s (id=%lu) Lambda=%.4f curve=%d points=%d closed=%s",
-                    index, source.objectName.c_str(),
-                    static_cast<unsigned long>(source.objectId), source.strength,
-                    source.usedCurve ? 1 : 0, source.controlPointCount,
+            LogInfo("  L[%zu] %s (id=%lu) Lambda=%.4f curve=%d points=%d closed=%s", index,
+                    source.objectName.c_str(), static_cast<unsigned long>(source.objectId),
+                    source.strength, source.usedCurve ? 1 : 0, source.controlPointCount,
                     BoolText(source.closed).c_str());
-            for (size_t point = 0; point < source.localPoints.size(); ++point) {
-                const VxVector &world = source.localPoints[point];
-                LogInfo("      p[%zu] local=(%.4f, %.4f, %.4f)", point, world.x, world.y, world.z);
-            }
         } else if (source.kind == SourceInfo::KindSheet) {
-            LogInfo("  S[%zu] %s (id=%lu) Sigma=%.4f patches=%d triangles=%d merged=%d",
-                    index, source.objectName.c_str(),
-                    static_cast<unsigned long>(source.objectId), source.strength,
-                    source.SheetPatchCount(), source.sheetTriangleCount, source.sheetMergedCount);
-            if (source.SheetPatchCount() == 0) {
-                LogInfo("      rectangle fallback center=(%.4f, %.4f, %.4f) size=(%.4f x %.4f)",
-                        source.localCenter.x, source.localCenter.y, source.localCenter.z,
-                        source.halfA * 2.0f, source.halfB * 2.0f);
-            }
+            LogInfo("  S[%zu] %s (id=%lu) Sigma=%.4f patches=%d triangles=%d merged=%d", index,
+                    source.objectName.c_str(), static_cast<unsigned long>(source.objectId),
+                    source.strength, source.SheetPatchCount(), source.sheetTriangleCount,
+                    source.sheetMergedCount);
         } else {
-            LogInfo("  M[%zu] %s (id=%lu) G=%.4f",
-                    index, source.objectName.c_str(),
+            LogInfo("  M[%zu] %s (id=%lu) G=%.4f", index, source.objectName.c_str(),
                     static_cast<unsigned long>(source.objectId), source.strength);
         }
     }
 
-    LogInfo("R rows: %zu", m_Scan.rRows.size());
-    for (size_t index = 0; index < m_Scan.rRows.size(); ++index) {
-        const RRowInfo &row = m_Scan.rRows[index];
-        std::string names;
-        for (const std::string &name : row.sourceNames) {
-            if (!names.empty()) {
-                names += ", ";
-            }
-            names += name;
-        }
-        LogInfo("  R[%zu] %s -> [%s]", index, row.regionName.c_str(), names.c_str());
+    LogInfo("Regions (FG_Region members): %zu", m_Scan.regions.size());
+    for (size_t index = 0; index < m_Scan.regions.size(); ++index) {
+        LogInfo("  R[%zu] %s (id=%lu) mesh=%s triangles=%zu", index,
+                m_Scan.regions[index].objectName.c_str(),
+                static_cast<unsigned long>(m_Scan.regions[index].objectId),
+                BoolText(m_Scan.regions[index].volume.meshValid).c_str(),
+                m_Scan.regions[index].volume.localIndices.size() / 3);
     }
 
-    LogInfo("Global sources (FG_RG): %zu", m_Scan.globalSourceIds.size());
-    for (size_t index = 0; index < m_Scan.globalSourceNames.size(); ++index) {
-        LogInfo("  RG[%zu] %s", index, m_Scan.globalSourceNames[index].c_str());
-    }
-
+    LogInfo("CField rows: %zu", m_Scan.cFields.size());
     static const char *const kCustomColumns[2][3] = {{"X", "Y", "Z"}, {"R", "Theta", "Phi"}};
-    LogInfo("Custom rows (FG_Custom): %zu", m_Scan.customFields.size());
-    for (size_t index = 0; index < m_Scan.customFields.size(); ++index) {
-        const CustomFieldInfo &field = m_Scan.customFields[index];
-        const int group = field.mode == 1 ? 1 : 0;
-        LogInfo("  C[%zu] \"%s\" mode=%d valid=%s", index, field.name.c_str(), field.mode,
-                BoolText(field.valid).c_str());
+    for (size_t index = 0; index < m_Scan.cFields.size(); ++index) {
+        const CFieldRow &field = m_Scan.cFields[index];
+        const int group = field.compiled.mode == 1 ? 1 : 0;
+        LogInfo("  C[%zu] \"%s\" mode=%d valid=%s", index, field.displayName.c_str(),
+                field.compiled.mode, BoolText(field.compiled.valid).c_str());
         for (int component = 0; component < 3; ++component) {
             const int column = group * 3 + component;
             LogInfo("      %s(len=%zu)=\"%s\"", kCustomColumns[group][component],
-                    field.text[column].size(), field.text[column].c_str());
+                    field.compiled.text[column].size(), field.compiled.text[column].c_str());
         }
-        for (int column = 0; column < 6; ++column) {
-            if (column / 3 != group && !field.text[column].empty()) {
-                LogInfo("      ignored %s(len=%zu)", kCustomColumns[column / 3][column % 3],
-                        field.text[column].size());
+        if (!field.compiled.error.empty()) {
+            LogInfo("      problem: %s", field.compiled.error.c_str());
+        }
+    }
+
+    LogInfo("CRegion rows: %zu", m_Scan.cRegions.size());
+    for (size_t index = 0; index < m_Scan.cRegions.size(); ++index) {
+        const CRegionRow &region = m_Scan.cRegions[index];
+        LogInfo("  CR[%zu] \"%s\" valid=%s domain=\"%s\"%s", index, region.displayName.c_str(),
+                BoolText(region.valid).c_str(), region.domainText.c_str(),
+                region.valid ? "" : (" [" + region.error + "]").c_str());
+    }
+
+    LogInfo("Local rows: %zu", m_Scan.localRows.size());
+    for (size_t index = 0; index < m_Scan.localRows.size(); ++index) {
+        const LocalRow &row = m_Scan.localRows[index];
+        std::string regionName = "<unknown>";
+        if (row.regionKind == LocalRow::BuiltinRegion && row.regionIndex >= 0 &&
+            row.regionIndex < static_cast<int>(m_Scan.regions.size())) {
+            regionName = m_Scan.regions[static_cast<size_t>(row.regionIndex)].objectName;
+        } else if (row.cRegionIndex >= 0 &&
+                   row.cRegionIndex < static_cast<int>(m_Scan.cRegions.size())) {
+            regionName = m_Scan.cRegions[static_cast<size_t>(row.cRegionIndex)].displayName;
+        }
+        std::string names;
+        for (const SourceRef &ref : row.sources) {
+            if (!names.empty()) {
+                names += ", ";
+            }
+            if (ref.kind == SourceRef::Builtin) {
+                names += m_Scan.sources[static_cast<size_t>(ref.index)].objectName;
+            } else {
+                names += "[C] ";
+                names += m_Scan.cFields[static_cast<size_t>(ref.index)].displayName;
             }
         }
-        LogInfo("      domain(len=%zu)=\"%s\"", field.domainText.size(), field.domainText.c_str());
-        if (!field.valid) {
-            LogInfo("      rejected: %s", field.error.c_str());
+        LogInfo("  L[%zu] %s (%s) -> [%s]", index, regionName.c_str(), RegionKindText(row),
+                names.c_str());
+    }
+
+    LogInfo("Global sources (FG_Global): %zu", m_Scan.globalSources.size());
+    for (size_t index = 0; index < m_Scan.globalSources.size(); ++index) {
+        const SourceRef &ref = m_Scan.globalSources[index];
+        if (ref.kind == SourceRef::Builtin) {
+            LogInfo("  G[%zu] %s", index, m_Scan.sources[static_cast<size_t>(ref.index)].objectName.c_str());
+        } else {
+            LogInfo("  G[%zu] [C] %s", index,
+                    m_Scan.cFields[static_cast<size_t>(ref.index)].displayName.c_str());
         }
     }
 
@@ -284,42 +386,16 @@ void FlexGravityMod::Reload(IBML *bml) {
     SendMessage("Scan reloaded; see ModLoader.log.");
 }
 
-// ---------------------------------------------------------------------------
-// FG_Custom diagnostics (fg debug custom / expr / domain)
-// ---------------------------------------------------------------------------
-
-namespace {
-
-const char *RelOpText(core::expr::RelOp op) {
-    switch (op) {
-    case core::expr::RelOp::Equal:
-        return "=";
-    case core::expr::RelOp::NotEqual:
-        return "!=";
-    case core::expr::RelOp::Less:
-        return "<";
-    case core::expr::RelOp::LessEqual:
-        return "<=";
-    case core::expr::RelOp::Greater:
-        return ">";
-    case core::expr::RelOp::GreaterEqual:
-        return ">=";
-    }
-    return "?";
-}
-
-} // namespace
-
-// Per-row Domain result and contribution at one point: the author's view of what
-// the custom fields are actually doing.
+// CField / CRegion view at one point.  This is the "why is this row not doing
+// anything here" report: it shows the Local/Global scope and the contribution.
 void FlexGravityMod::PrintCustomStatus(IBML *bml, bool hasPoint, const VxVector &point) {
     (void) bml;
     if (!m_Scan.ran) {
         SendMessage("Not scanned yet. Enter a level or run 'fg debug reload'.");
         return;
     }
-    if (m_Scan.customFields.empty()) {
-        SendMessage("No FG_Custom rows in this level.");
+    if (m_Scan.cFields.empty() && m_Scan.cRegions.empty()) {
+        SendMessage("No FG_CField / FG_CRegion rows in this level.");
         return;
     }
 
@@ -336,34 +412,63 @@ void FlexGravityMod::PrintCustomStatus(IBML *bml, bool hasPoint, const VxVector 
     }
 
     const PointFrame frame = core::expr::MakePointFrame(where);
-    LogInfo("FG_Custom %s: p=%s r=%.4f theta=%.4f phi=%.4f", label.c_str(),
+    LogInfo("FG_CField/FG_CRegion %s: p=%s r=%.4f theta=%.4f phi=%.4f", label.c_str(),
             FormatVec(where).c_str(), frame.variables[core::expr::kVarR],
             frame.variables[core::expr::kVarTheta], frame.variables[core::expr::kVarPhi]);
 
-    VxVector total(0.0f, 0.0f, 0.0f);
-    int activeCount = 0;
-    for (size_t index = 0; index < m_Scan.customFields.size(); ++index) {
-        const CustomFieldInfo &field = m_Scan.customFields[index];
-        if (!field.valid) {
-            LogInfo("  C[%zu] \"%s\" rejected: %s", index, field.name.c_str(), field.error.c_str());
-            continue;
-        }
+    std::vector<char> rowTouched(m_Scan.localRows.size(), 0);
+    std::vector<char> sourceMask(m_Scan.sources.size(), 0);
+    std::vector<char> cFieldMask(m_Scan.cFields.size(), 0);
+    const VxVector total = EvaluateActiveFieldsAtPoint(where, rowTouched, sourceMask, cFieldMask);
 
-        bool nonFinite = false;
-        const bool active = core::expr::EvaluateCustomDomain(field, frame, &nonFinite);
-        VxVector contribution(0.0f, 0.0f, 0.0f);
+    int activeFields = 0;
+    for (size_t index = 0; index < m_Scan.cFields.size(); ++index) {
+        const CFieldRow &field = m_Scan.cFields[index];
+        const bool active = index < cFieldMask.size() && cFieldMask[index] != 0;
         if (active) {
-            contribution = core::expr::EvaluateCustomComponents(field, frame, &nonFinite);
-            total = Add(total, contribution);
-            ++activeCount;
+            ++activeFields;
         }
-        LogInfo("  C[%zu] \"%s\" mode=%d domain=\"%s\" active=%s%s g=(%.4f, %.4f, %.4f)", index,
-                field.name.c_str(), field.mode, field.domainText.c_str(), BoolText(active).c_str(),
-                nonFinite ? " (NaN/Inf)" : "", contribution.x, contribution.y, contribution.z);
+        const bool global =
+                RefsContain(m_Scan.globalSources, SourceRef::Custom, static_cast<int>(index));
+        bool local = false;
+        for (size_t row = 0; row < rowTouched.size(); ++row) {
+            if (rowTouched[row] &&
+                RefsContain(m_Scan.localRows[row].sources, SourceRef::Custom, static_cast<int>(index))) {
+                local = true;
+                break;
+            }
+        }
+        VxVector contribution(0.0f, 0.0f, 0.0f);
+        if (active && field.compiled.valid) {
+            bool nonFinite = false;
+            contribution = core::expr::EvaluateCField(field.compiled, frame, &nonFinite);
+        }
+        LogInfo("  C[%zu] \"%s\" mode=%d scope=%s active=%s g=(%.4f, %.4f, %.4f)", index,
+                field.displayName.c_str(), field.compiled.mode,
+                global && local ? "local+global" : (global ? "global" : (local ? "local" : "-")),
+                BoolText(active).c_str(), contribution.x, contribution.y, contribution.z);
     }
 
-    const std::string message = "custom rows=" + std::to_string(m_Scan.customFields.size()) +
-                                " active=" + std::to_string(activeCount) +
+    int activeRegions = 0;
+    for (size_t index = 0; index < m_Scan.cRegions.size(); ++index) {
+        const CRegionRow &region = m_Scan.cRegions[index];
+        bool inside = false;
+        bool nonFinite = false;
+        if (region.valid) {
+            inside = core::expr::EvaluateDomain(region.domain, frame.variables, &nonFinite);
+        }
+        if (inside) {
+            ++activeRegions;
+        }
+        LogInfo("  CR[%zu] \"%s\" valid=%s inside=%s%s", index, region.displayName.c_str(),
+                BoolText(region.valid).c_str(), BoolText(inside).c_str(),
+                nonFinite ? " (NaN/Inf)" : "");
+    }
+
+    const std::string message = "custom: cfields=" + std::to_string(m_Scan.cFields.size()) +
+                                " active=" + std::to_string(activeFields) +
+                                " cregions=" + std::to_string(m_Scan.cRegions.size()) +
+                                " inside=" + std::to_string(activeRegions) +
                                 " total=" + FormatVec(total) + " " + label;
     SendMessage(message);
     LogInfo("%s", message.c_str());
@@ -423,13 +528,13 @@ void FlexGravityMod::PrintDomainProbe(IBML *bml, bool hasPoint, const VxVector &
     if (!hasPoint) {
         CK3dEntity *ball = FindActiveBall();
         if (!ball) {
-            SendMessage("No active ball found; use 'fg debug domain at <x> <y> <z> <relations>'.");
+            SendMessage("No active ball found; use 'fg debug domain at <x> <y> <z> <expression>'.");
             return;
         }
         where = ball->GetWorldMatrix() * VxVector(0.0f, 0.0f, 0.0f);
     }
     if (text.empty()) {
-        SendMessage("Usage: fg debug domain [at x y z] <relations>");
+        SendMessage("Usage: fg debug domain [at x y z] <domain expression>");
         return;
     }
 
@@ -459,4 +564,3 @@ void FlexGravityMod::PrintDomainProbe(IBML *bml, bool hasPoint, const VxVector &
     SendMessage(message);
     LogInfo("%s", message.c_str());
 }
-

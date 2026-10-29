@@ -76,6 +76,7 @@ target_link_libraries(FlexGravity PRIVATE
 )
 
 target_compile_definitions(FlexGravity PRIVATE
+        WIN32
         _CRT_SECURE_NO_WARNINGS
         _CRT_NONSTDC_NO_WARNINGS
         NOMINMAX
@@ -108,12 +109,14 @@ set_target_properties(FlexGravity PROPERTIES
 )
 
 # Engine-free regression tests.  They run without Virtools or Ballance and
-# pin the formulas to the values verified in game.
-option(FLEXGRAVITY_BUILD_TESTS "Build the engine-free core tests" ON)
+# pin the formulas to the values verified in game.  They are developer tools,
+# not part of the mod, so they are OFF by default and a checkout without tests/
+# still configures and builds the mod.
+option(FLEXGRAVITY_BUILD_TESTS "Build the engine-free core tests" OFF)
 
-if (FLEXGRAVITY_BUILD_TESTS)
+if (FLEXGRAVITY_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_core.cpp")
     add_executable(flexgravity_tests
-            tests/test_core.cpp
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_core.cpp"
             ${FLEXGRAVITY_CORE_SOURCES}
     )
 
@@ -127,6 +130,7 @@ if (FLEXGRAVITY_BUILD_TESTS)
     )
 
     target_compile_definitions(flexgravity_tests PRIVATE
+            WIN32
             _CRT_SECURE_NO_WARNINGS
             _CRT_NONSTDC_NO_WARNINGS
             NOMINMAX
@@ -144,8 +148,9 @@ if (FLEXGRAVITY_BUILD_TESTS)
     )
 
     # Timing harness; run manually, never part of the shipped mod.
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../bench/bench_core.cpp")
     add_executable(flexgravity_bench
-            bench/bench_core.cpp
+            "${CMAKE_CURRENT_SOURCE_DIR}/../bench/bench_core.cpp"
             ${FLEXGRAVITY_CORE_SOURCES}
     )
 
@@ -174,4 +179,5 @@ if (FLEXGRAVITY_BUILD_TESTS)
             RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/bin"
             RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/bin"
     )
+    endif ()
 endif ()

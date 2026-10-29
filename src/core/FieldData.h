@@ -6,6 +6,7 @@
 #include <VxVector.h>
 
 #include "core/expr/FunctionField.h"
+#include "core/expr/Parser.h"
 #include "core/RegionVolume.h"
 #include "core/Types.h"
 
@@ -68,12 +69,50 @@ struct SourceInfo {
     bool geometryValid = false;
 };
 
-struct RRowInfo {
-    ObjectId regionObjectId = 0;
-    std::string regionName;
-    RegionVolume region;
-    std::vector<ObjectId> sourceIds;
-    std::vector<std::string> sourceNames;
+// A member of the FG_Region group.  The group is the only source of built-in
+// regions in v2.1; there is no FG_Region array.
+struct RegionMember {
+    ObjectId objectId = 0;
+    std::string objectName;
+    RegionVolume volume;
+};
+
+// One FG_CField row.  Matching is by object reference (`objectId`), never by
+// name; `displayName` only exists for logs.
+struct CFieldRow {
+    ObjectId objectId = 0;
+    std::string objectName;  // raw bytes from the object table (ANSI/GBK)
+    std::string displayName; // objectName without the 0x01 "__" prefix
+    expr::CompiledCField compiled;
+};
+
+// One FG_CRegion row: an expression-defined region.
+struct CRegionRow {
+    ObjectId objectId = 0;
+    std::string objectName;
+    std::string displayName;
+    std::string domainText;
+    expr::Domain domain;
+    bool valid = false;
+    std::string error;
+};
+
+// A reference to a source from FG_Local / FG_Global.  `Builtin` indexes
+// ScanInfo::sources (M/L/S), `Custom` indexes ScanInfo::cFields.
+struct SourceRef {
+    enum Kind { Builtin = 0, Custom = 1 };
+    Kind kind = Builtin;
+    int index = -1;
+};
+
+// One FG_Local row: a region (built-in or CRegion) plus the sources that only
+// apply inside it.
+struct LocalRow {
+    enum RegionKind { BuiltinRegion = 0, CustomRegion = 1 };
+    RegionKind regionKind = BuiltinRegion;
+    int regionIndex = -1;  // index into ScanInfo::regions
+    int cRegionIndex = -1; // index into ScanInfo::cRegions
+    std::vector<SourceRef> sources;
 };
 
 struct GroupScan {
@@ -94,29 +133,34 @@ struct ScanInfo {
     GroupScan mGroup;
     GroupScan lGroup;
     GroupScan sGroup;
-    GroupScan rGroup;
+    GroupScan regionGroup;
+    GroupScan cFieldGroup;
+    GroupScan cRegionGroup;
 
     ArrayScan uArray;
     ArrayScan mArray;
     ArrayScan lArray;
     ArrayScan sArray;
-    ArrayScan rArray;
-    ArrayScan rgArray;
-    ArrayScan customArray;
+    ArrayScan cFieldArray;
+    ArrayScan cRegionArray;
+    ArrayScan localArray;
+    ArrayScan globalArray;
 
     std::vector<UFieldInfo> uFields;
     std::vector<SourceInfo> sources;
-    std::vector<RRowInfo> rRows;
-    // FG_Custom rows.  Rejected rows stay in the list so the debug reports can
-    // show why they were rejected; the runtime skips them.
-    std::vector<expr::CustomFieldInfo> customFields;
-    std::vector<ObjectId> globalSourceIds;
-    std::vector<std::string> globalSourceNames;
+    std::vector<RegionMember> regions;
+    std::vector<CRegionRow> cRegions;
+    // Rejected CField rows stay in the list so the debug reports can show why
+    // they were rejected; the runtime skips them.
+    std::vector<CFieldRow> cFields;
+    std::vector<LocalRow> localRows;
+    std::vector<SourceRef> globalSources;
 
     std::vector<std::string> warnings;
 
-    // Array rows dropped because the object is not a member of the matching
-    // group.  Group membership is mandatory: an array entry alone does nothing.
+    // Rows dropped because the object is not a member of the matching group,
+    // because the placeholder prefix is missing, or because it is not a 3D
+    // entity.  Membership is mandatory in v2.1.
     int ignoredEntries = 0;
 };
 

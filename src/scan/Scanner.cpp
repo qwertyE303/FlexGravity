@@ -1,5 +1,38 @@
 #include "mod/FlexGravityMod.h"
 
+#include <unordered_map>
+#include <unordered_set>
+
+// v2.1 data layout.  Group membership is mandatory for every field and region:
+// a row whose object is not in the matching group is invalid, not merely a
+// warning.  Only FG_Local / FG_Global are pure arrays with no group.
+//
+//   FG_UField / FG_MField / FG_LField / FG_SField : group + array (Object + value)
+//   FG_Region                                    : group only
+//   FG_CField                                    : group + array (Name object, Mode, 6 strings)
+//   FG_CRegion                                   : group + array (Name object, Domain)
+//   FG_Local                                     : array (Region, Source1..N)
+//   FG_Global                                    : array (Source1..N)
+
+namespace {
+
+struct Lookup {
+    std::unordered_map<CK_ID, int> byObject;
+};
+
+std::string JoinNames(const std::vector<std::string> &names) {
+    std::string joined;
+    for (const std::string &name : names) {
+        if (!joined.empty()) {
+            joined += ", ";
+        }
+        joined += name;
+    }
+    return joined;
+}
+
+} // namespace
+
 void FlexGravityMod::ScanGroup(const char *name, GroupScan &result,
                                std::unordered_map<CK_ID, std::string> &members) {
     CKGroup *group = FindGroup(name);
@@ -15,25 +48,30 @@ void FlexGravityMod::ScanGroup(const char *name, GroupScan &result,
     for (int index = 0; index < result.count; ++index) {
         CKBeObject *beObject = group->GetObject(index);
         if (!beObject) {
-            Warn(std::string("Group ") + name + " has a null member at index " + std::to_string(index));
+            Warn(std::string("Group ") + name + " has a null member at index " +
+                 std::to_string(index));
             continue;
         }
 
         CK3dEntity *entity = CK3dEntity::Cast(beObject);
         if (!entity) {
-            Warn(std::string("Group ") + name + " member is not a 3D entity: " + ObjectText(beObject));
+            Warn(std::string("Group ") + name + " member is not a 3D entity: " +
+                 ObjectText(beObject));
             continue;
         }
 
         members[entity->GetID()] = SafeName(entity);
-        LogInfo("  [%d] %s", index, ObjectText(entity).c_str());
+        // DisplayObjectName strips the \x01__ placeholder prefix and converts
+        // ANSI/GBK to UTF-8, so the log never receives a raw control byte.
+        LogInfo("  [%d] %s (id=%lu, %s)", index, DisplayObjectName(entity).c_str(),
+                static_cast<unsigned long>(entity->GetID()), ClassText(entity).c_str());
     }
 }
 
 void FlexGravityMod::ScanUArray(const std::unordered_map<CK_ID, std::string> &groupMembers) {
     CKDataArray *array = FindArray(kArrayU);
     if (!array) {
-        Warn("Array not found: FG_U");
+        Warn("Array not found: FG_UField");
         return;
     }
 
@@ -45,14 +83,14 @@ void FlexGravityMod::ScanUArray(const std::unordered_map<CK_ID, std::string> &gr
     int objectColumn = FindColumn(array, "Object");
     if (objectColumn < 0) {
         objectColumn = 0;
-        Warn("FG_U has no column named Object; falling back to column 0");
+        Warn("FG_UField has no column named Object; falling back to column 0");
     }
 
     int xColumn = FindColumn(array, "x");
     int yColumn = FindColumn(array, "y");
     int zColumn = FindColumn(array, "z");
     if (xColumn < 0 || yColumn < 0 || zColumn < 0) {
-        Warn("FG_U is missing one or more x/y/z columns");
+        Warn("FG_UField is missing one or more x/y/z columns");
         if (xColumn < 0) xColumn = 1;
         if (yColumn < 0) yColumn = 2;
         if (zColumn < 0) zColumn = 3;
@@ -62,13 +100,15 @@ void FlexGravityMod::ScanUArray(const std::unordered_map<CK_ID, std::string> &gr
     for (int row = 0; row < m_Scan.uArray.rows; ++row) {
         CKObject *cellObject = GetCellObject(array, row, objectColumn);
         if (!cellObject) {
-            LogInfo("  FG_U row[%d]: empty object cell", row);
+            LogInfo("  FG_UField row[%d]: empty object cell", row);
             continue;
         }
 
         CK3dEntity *entity = CK3dEntity::Cast(cellObject);
         if (!entity) {
-            Warn("FG_U row " + std::to_string(row) + " object is not a 3D entity: " + ObjectText(cellObject));
+            Warn("FG_UField row " + std::to_string(row) + " object is not a 3D entity: " +
+                 ObjectText(cellObject));
+            ++m_Scan.ignoredEntries;
             continue;
         }
 
@@ -80,17 +120,18 @@ void FlexGravityMod::ScanUArray(const std::unordered_map<CK_ID, std::string> &gr
                                  GetCellFloat(array, row, zColumn, 0.0f));
 
         if (!seen.insert(field.objectId).second) {
-            Warn("FG_U lists object more than once: " + field.objectName);
+            Warn("FG_UField lists object more than once: " + field.objectName);
         }
         if (groupMembers.find(field.objectId) == groupMembers.end()) {
-            Warn("FG_U object is not in the FG_U group: " + field.objectName + " (ignored)");
+            Warn("FG_UField object is not in the FG_UField group: " + field.objectName +
+                 " (ignored)");
             ++m_Scan.ignoredEntries;
             continue;
         }
 
         BuildRegionCache(entity, field.region, field.objectName.c_str());
         m_Scan.uFields.push_back(field);
-        LogInfo("  FG_U row[%d]: %s g=(%.4f, %.4f, %.4f)", row, field.objectName.c_str(),
+        LogInfo("  FG_UField row[%d]: %s g=(%.4f, %.4f, %.4f)", row, field.objectName.c_str(),
                 field.gravity.x, field.gravity.y, field.gravity.z);
     }
 }
@@ -134,6 +175,7 @@ void FlexGravityMod::ScanSourceArray(SourceInfo::Kind kind, const char *arrayNam
         if (!entity) {
             Warn(std::string(arrayName) + " row " + std::to_string(row) +
                  " object is not a 3D entity: " + ObjectText(cellObject));
+            ++m_Scan.ignoredEntries;
             continue;
         }
 
@@ -171,15 +213,13 @@ void FlexGravityMod::ScanSourceArray(SourceInfo::Kind kind, const char *arrayNam
                 first = FormatVec(world * source.localPoints.front());
                 last = FormatVec(world * source.localPoints.back());
             }
-            LogInfo("  FG_L row[%d]: %s Lambda=%.4f curve=%d points=%d closed=%s A=%s B=%s",
+            LogInfo("  FG_LField row[%d]: %s Lambda=%.4f curve=%d points=%d closed=%s A=%s B=%s",
                     row, source.objectName.c_str(), source.strength,
                     source.usedCurve ? 1 : 0, source.controlPointCount,
                     BoolText(source.closed).c_str(), first.c_str(), last.c_str());
         } else if (kind == SourceInfo::KindSheet) {
             const VxMatrix &world = entity->GetWorldMatrix();
             if (source.SheetPatchCount() > 0) {
-                // World centroid, local bounding box and the first patch's
-                // world normal: enough to recognise the object in the log.
                 VxVector sum(0.0f, 0.0f, 0.0f);
                 VxVector minimum(1.0e6f, 1.0e6f, 1.0e6f);
                 VxVector maximum(-1.0e6f, -1.0e6f, -1.0e6f);
@@ -192,8 +232,8 @@ void FlexGravityMod::ScanSourceArray(SourceInfo::Kind kind, const char *arrayNam
                     maximum.y = (std::max)(maximum.y, local.y);
                     maximum.z = (std::max)(maximum.z, local.z);
                 }
-                const VxVector center = Scale(sum, 1.0f /
-                                              static_cast<float>(source.sheetVertices.size()));
+                const VxVector center =
+                        Scale(sum, 1.0f / static_cast<float>(source.sheetVertices.size()));
                 const int begin = source.sheetOffsets[0];
                 VxVector normal(0.0f, 0.0f, 0.0f);
                 Normalize(Cross(Subtract(world * source.sheetVertices[begin + 1],
@@ -202,12 +242,12 @@ void FlexGravityMod::ScanSourceArray(SourceInfo::Kind kind, const char *arrayNam
                                          world * source.sheetVertices[begin])),
                           normal);
                 const VxVector size = Subtract(maximum, minimum);
-                LogInfo("  FG_S row[%d]: %s Sigma=%.4f patches=%d tris=%d merged=%d "
+                LogInfo("  FG_SField row[%d]: %s Sigma=%.4f patches=%d tris=%d merged=%d "
                         "center=%s size=(%.4f x %.4f x %.4f) normal=%s",
                         row, source.objectName.c_str(), source.strength,
                         source.SheetPatchCount(), source.sheetTriangleCount,
-                        source.sheetMergedCount, FormatVec(center).c_str(),
-                        size.x, size.y, size.z, FormatVec(normal).c_str());
+                        source.sheetMergedCount, FormatVec(center).c_str(), size.x, size.y, size.z,
+                        FormatVec(normal).c_str());
             } else {
                 const VxVector center = world * source.localCenter;
                 VxVector axisA(0.0f, 0.0f, 0.0f);
@@ -216,167 +256,466 @@ void FlexGravityMod::ScanSourceArray(SourceInfo::Kind kind, const char *arrayNam
                 Normalize(world * source.localAxisA, axisA);
                 Normalize(world * source.localAxisB, axisB);
                 Normalize(Cross(axisA, axisB), normal);
-                LogInfo("  FG_S row[%d]: %s Sigma=%.4f rect center=%s size=(%.4f x %.4f) normal=%s",
+                LogInfo("  FG_SField row[%d]: %s Sigma=%.4f rect center=%s size=(%.4f x %.4f) "
+                        "normal=%s",
                         row, source.objectName.c_str(), source.strength,
                         FormatVec(center).c_str(), source.halfA * 2.0f, source.halfB * 2.0f,
                         FormatVec(normal).c_str());
             }
         } else {
-            LogInfo("  FG_M row[%d]: %s G=%.4f", row, source.objectName.c_str(), source.strength);
+            LogInfo("  FG_MField row[%d]: %s G=%.4f", row, source.objectName.c_str(),
+                    source.strength);
         }
     }
 }
 
-void FlexGravityMod::ScanRArray(const std::unordered_map<CK_ID, std::string> &groupMembers) {
-    CKDataArray *array = FindArray(kArrayR);
+// FG_Region has no array: the group members themselves are the regions.
+void FlexGravityMod::ScanRegionGroup(const std::unordered_map<CK_ID, std::string> &members) {
+    for (const auto &entry : members) {
+        CK3dEntity *entity = ResolveEntity(entry.first);
+        if (!entity) {
+            Warn("FG_Region member disappeared while scanning: " + entry.second);
+            continue;
+        }
+        RegionMember region;
+        region.objectId = entry.first;
+        region.objectName = entry.second;
+        BuildRegionCache(entity, region.volume, entry.second.c_str());
+        m_Scan.regions.push_back(region);
+        LogInfo("  FG_Region member: %s", entry.second.c_str());
+    }
+}
+
+void FlexGravityMod::ScanCFieldArray(const std::unordered_map<CK_ID, std::string> &groupMembers) {
+    CKDataArray *array = FindArray(kArrayCField);
     if (!array) {
-        Warn("Array not found: FG_R");
+        Warn("Array not found: FG_CField");
         return;
     }
 
-    m_Scan.rArray.present = true;
-    m_Scan.rArray.rows = array->GetRowCount();
-    m_Scan.rArray.columns = array->GetColumnCount();
-    LogArrayColumns(array, kArrayR);
+    m_Scan.cFieldArray.present = true;
+    m_Scan.cFieldArray.rows = array->GetRowCount();
+    m_Scan.cFieldArray.columns = array->GetColumnCount();
+    LogArrayColumns(array, kArrayCField);
 
-    if (m_Scan.rArray.columns < 2) {
-        Warn("FG_R needs at least two object columns (region + at least one source)");
+    static const char *const kComponentColumns[6] = {"X", "Y", "Z", "R", "Theta", "Phi"};
+
+    const int nameColumn = FindColumn(array, "Name");
+    const int modeColumn = FindColumn(array, "Mode");
+    if (nameColumn < 0) {
+        Warn("FG_CField has no column named Name");
         return;
     }
+    if (array->GetColumnType(nameColumn) != CKARRAYTYPE_OBJECT) {
+        Warn("FG_CField column Name is not an Object column; every row is ignored");
+        return;
+    }
+    if (m_Scan.cFieldArray.columns != 8) {
+        Warn("FG_CField has " + std::to_string(m_Scan.cFieldArray.columns) +
+             " columns; expected 8 (Name, Mode, X, Y, Z, R, Theta, Phi)");
+    }
 
-    for (int row = 0; row < m_Scan.rArray.rows; ++row) {
-        CKObject *cellObject = GetCellObject(array, row, 0);
+    int componentColumn[6] = {-1, -1, -1, -1, -1, -1};
+    for (int index = 0; index < 6; ++index) {
+        componentColumn[index] = FindColumn(array, kComponentColumns[index]);
+        if (componentColumn[index] < 0) {
+            Warn(std::string("FG_CField has no column named ") + kComponentColumns[index]);
+        }
+    }
+
+    std::unordered_set<CK_ID> seen;
+    for (int row = 0; row < m_Scan.cFieldArray.rows; ++row) {
+        CKObject *cellObject = GetCellObject(array, row, nameColumn);
         if (!cellObject) {
-            LogInfo("  FG_R row[%d]: empty region cell", row);
+            LogInfo("  FG_CField row[%d]: empty Name cell", row);
             continue;
         }
 
-        CK3dEntity *regionEntity = CK3dEntity::Cast(cellObject);
-        if (!regionEntity) {
-            Warn("FG_R row " + std::to_string(row) + " first cell is not a 3D entity: " +
+        CK3dEntity *entity = CK3dEntity::Cast(cellObject);
+        if (!entity) {
+            Warn("FG_CField row " + std::to_string(row) + " Name is not a 3D entity: " +
                  ObjectText(cellObject));
-            continue;
-        }
-
-        RRowInfo rRow;
-        rRow.regionObjectId = regionEntity->GetID();
-        rRow.regionName = SafeName(regionEntity);
-
-        if (groupMembers.find(rRow.regionObjectId) == groupMembers.end()) {
-            // The region is the scope: without it the row scopes nothing, so
-            // the whole row (region + sources) is inert.
-            Warn("FG_R region object is not in the FG_R group: " + rRow.regionName + " (row ignored)");
             ++m_Scan.ignoredEntries;
             continue;
         }
 
-        BuildRegionCache(regionEntity, rRow.region, rRow.regionName.c_str());
+        const std::string rawName = SafeName(entity);
+        if (!HasPlaceholderPrefix(rawName)) {
+            Warn("FG_CField row " + std::to_string(row) +
+                 " object name lacks the \\x01__ prefix: " + DisplayName(rawName) + " (ignored)");
+            ++m_Scan.ignoredEntries;
+            continue;
+        }
+        if (groupMembers.find(entity->GetID()) == groupMembers.end()) {
+            Warn("FG_CField object is not in the FG_CField group: " + DisplayName(rawName) +
+                 " (ignored)");
+            ++m_Scan.ignoredEntries;
+            continue;
+        }
+        if (!seen.insert(entity->GetID()).second) {
+            Warn("FG_CField lists object more than once: " + DisplayName(rawName) +
+                 " (duplicate row ignored)");
+            ++m_Scan.ignoredEntries;
+            continue;
+        }
 
-        std::unordered_set<CK_ID> seenSources;
-        for (int column = 1; column < m_Scan.rArray.columns; ++column) {
+        int mode = 0;
+        if (modeColumn >= 0 && GetCellInt(array, row, modeColumn, mode)) {
+            if (mode != 0 && mode != 1) {
+                Warn("FG_CField row " + std::to_string(row) + " has Mode=" +
+                     std::to_string(mode) + "; using rectangular coordinates");
+                mode = 0;
+            }
+        } else {
+            mode = 0;
+        }
+
+        std::string text[6];
+        for (int index = 0; index < 6; ++index) {
+            if (componentColumn[index] >= 0) {
+                GetCellString(array, row, componentColumn[index], text[index]);
+            }
+        }
+
+        CFieldRow field;
+        field.objectId = entity->GetID();
+        field.objectName = rawName;
+        field.displayName = DisplayName(rawName);
+        CompileCField(text, mode, field.compiled);
+        field.compiled.name = field.displayName;
+
+        const int group = field.compiled.mode;
+        if (!field.compiled.error.empty()) {
+            Warn("FG_CField row " + std::to_string(row) + " \"" + field.displayName +
+                 "\": " + field.compiled.error + " (component treated as 0)");
+        }
+        for (int component = 0; component < 3; ++component) {
+            if (field.compiled.emptyComponent[component]) {
+                Warn("FG_CField row " + std::to_string(row) + " \"" + field.displayName + "\": " +
+                     kComponentColumns[group * 3 + component] + " is empty, treated as 0");
+            }
+        }
+
+        std::string detail = "  FG_CField row[" + std::to_string(row) + "]: \"" +
+                             field.displayName + "\" mode=" + std::to_string(field.compiled.mode);
+        for (int component = 0; component < 3; ++component) {
+            const int column = group * 3 + component;
+            detail += " ";
+            detail += kComponentColumns[column];
+            detail += "(len=" + std::to_string(field.compiled.text[column].size()) + ")=\"" +
+                      field.compiled.text[column] + "\"";
+        }
+        LogInfo("%s", detail.c_str());
+
+        m_Scan.cFields.push_back(field);
+    }
+
+    LogInfo("FG_CField: %zu row(s) parsed", m_Scan.cFields.size());
+}
+
+void FlexGravityMod::ScanCRegionArray(const std::unordered_map<CK_ID, std::string> &groupMembers) {
+    CKDataArray *array = FindArray(kArrayCRegion);
+    if (!array) {
+        Warn("Array not found: FG_CRegion");
+        return;
+    }
+
+    m_Scan.cRegionArray.present = true;
+    m_Scan.cRegionArray.rows = array->GetRowCount();
+    m_Scan.cRegionArray.columns = array->GetColumnCount();
+    LogArrayColumns(array, kArrayCRegion);
+
+    const int nameColumn = FindColumn(array, "Name");
+    const int domainColumn = FindColumn(array, "Domain");
+    if (nameColumn < 0) {
+        Warn("FG_CRegion has no column named Name");
+        return;
+    }
+    if (array->GetColumnType(nameColumn) != CKARRAYTYPE_OBJECT) {
+        Warn("FG_CRegion column Name is not an Object column; every row is ignored");
+        return;
+    }
+    if (domainColumn < 0) {
+        Warn("FG_CRegion has no column named Domain; every row applies everywhere");
+    }
+    if (m_Scan.cRegionArray.columns != 2) {
+        Warn("FG_CRegion has " + std::to_string(m_Scan.cRegionArray.columns) +
+             " columns; expected 2 (Name, Domain)");
+    }
+
+    std::unordered_set<CK_ID> seen;
+    for (int row = 0; row < m_Scan.cRegionArray.rows; ++row) {
+        CKObject *cellObject = GetCellObject(array, row, nameColumn);
+        if (!cellObject) {
+            LogInfo("  FG_CRegion row[%d]: empty Name cell", row);
+            continue;
+        }
+
+        CK3dEntity *entity = CK3dEntity::Cast(cellObject);
+        if (!entity) {
+            Warn("FG_CRegion row " + std::to_string(row) + " Name is not a 3D entity: " +
+                 ObjectText(cellObject));
+            ++m_Scan.ignoredEntries;
+            continue;
+        }
+
+        const std::string rawName = SafeName(entity);
+        if (!HasPlaceholderPrefix(rawName)) {
+            Warn("FG_CRegion row " + std::to_string(row) +
+                 " object name lacks the \\x01__ prefix: " + DisplayName(rawName) + " (ignored)");
+            ++m_Scan.ignoredEntries;
+            continue;
+        }
+        if (groupMembers.find(entity->GetID()) == groupMembers.end()) {
+            Warn("FG_CRegion object is not in the FG_CRegion group: " + DisplayName(rawName) +
+                 " (ignored)");
+            ++m_Scan.ignoredEntries;
+            continue;
+        }
+        if (!seen.insert(entity->GetID()).second) {
+            Warn("FG_CRegion lists object more than once: " + DisplayName(rawName) +
+                 " (duplicate row ignored)");
+            ++m_Scan.ignoredEntries;
+            continue;
+        }
+
+        CRegionRow region;
+        region.objectId = entity->GetID();
+        region.objectName = rawName;
+        region.displayName = DisplayName(rawName);
+        if (domainColumn >= 0) {
+            GetCellString(array, row, domainColumn, region.domainText);
+        }
+
+        region.valid = true;
+        if (region.domainText.empty()) {
+            // Defensive: the editor requires a non-empty Domain.  An empty one
+            // means "no restriction" and is reported, not fatal.
+            Warn("FG_CRegion \"" + region.displayName +
+                 "\" has an empty Domain, so it applies everywhere");
+        } else {
+            CompileError error;
+            if (!CompileDomain(region.domainText, region.domain, error)) {
+                region.valid = false;
+                region.error = error.message + " (byte " + std::to_string(error.position) + ")";
+                Warn("FG_CRegion \"" + region.displayName + "\" rejected: " + region.error);
+            }
+        }
+
+        LogInfo("  FG_CRegion row[%d]: \"%s\" domain(len=%zu)=\"%s\"%s", row,
+                region.displayName.c_str(), region.domainText.size(), region.domainText.c_str(),
+                region.valid ? "" : " [rejected]");
+        m_Scan.cRegions.push_back(region);
+    }
+
+    LogInfo("FG_CRegion: %zu row(s) parsed", m_Scan.cRegions.size());
+}
+
+void FlexGravityMod::ScanLocalArray(
+        const std::unordered_map<CK_ID, int> &regionIndex,
+        const std::unordered_map<CK_ID, int> &cRegionIndex,
+        const std::unordered_map<CK_ID, int> &sourceIndex,
+        const std::unordered_map<CK_ID, int> &cFieldIndex,
+        const std::unordered_set<CK_ID> &uObjects) {
+    CKDataArray *array = FindArray(kArrayLocal);
+    if (!array) {
+        Warn("Array not found: FG_Local");
+        return;
+    }
+
+    m_Scan.localArray.present = true;
+    m_Scan.localArray.rows = array->GetRowCount();
+    m_Scan.localArray.columns = array->GetColumnCount();
+    LogArrayColumns(array, kArrayLocal);
+
+    if (m_Scan.localArray.columns < 2) {
+        Warn("FG_Local needs a Region column and at least one Source column");
+        return;
+    }
+
+    for (int row = 0; row < m_Scan.localArray.rows; ++row) {
+        CKObject *regionCell = GetCellObject(array, row, 0);
+        if (!regionCell) {
+            Warn("FG_Local row " + std::to_string(row) + " has an empty Region cell (row ignored)");
+            ++m_Scan.ignoredEntries;
+            continue;
+        }
+
+        CK3dEntity *regionEntity = CK3dEntity::Cast(regionCell);
+        if (!regionEntity) {
+            Warn("FG_Local row " + std::to_string(row) + " Region is not a 3D entity: " +
+                 ObjectText(regionCell));
+            ++m_Scan.ignoredEntries;
+            continue;
+        }
+
+        LocalRow local;
+        auto builtin = regionIndex.find(regionEntity->GetID());
+        auto custom = cRegionIndex.find(regionEntity->GetID());
+        if (builtin != regionIndex.end()) {
+            local.regionKind = LocalRow::BuiltinRegion;
+            local.regionIndex = builtin->second;
+        } else if (custom != cRegionIndex.end()) {
+            local.regionKind = LocalRow::CustomRegion;
+            local.cRegionIndex = custom->second;
+            if (!m_Scan.cRegions[static_cast<size_t>(local.cRegionIndex)].valid) {
+                Warn("FG_Local row " + std::to_string(row) +
+                     " references a rejected FG_CRegion; row ignored");
+                ++m_Scan.ignoredEntries;
+                continue;
+            }
+        } else {
+            Warn("FG_Local row " + std::to_string(row) +
+                 " Region is neither an FG_Region member nor a valid FG_CRegion: " +
+                 SafeName(regionEntity) + " (row ignored)");
+            ++m_Scan.ignoredEntries;
+            continue;
+        }
+
+        std::unordered_set<CK_ID> seen;
+        std::vector<std::string> names;
+        for (int column = 1; column < m_Scan.localArray.columns; ++column) {
             CKObject *cell = GetCellObject(array, row, column);
             if (!cell) {
                 continue;
             }
-
             CK3dEntity *sourceEntity = CK3dEntity::Cast(cell);
             if (!sourceEntity) {
-                Warn("FG_R row " + std::to_string(row) + " column " + std::to_string(column) +
+                Warn("FG_Local row " + std::to_string(row) + " column " + std::to_string(column) +
                      " is not a 3D entity: " + ObjectText(cell));
                 continue;
             }
 
-            if (!seenSources.insert(sourceEntity->GetID()).second) {
-                continue;
-            }
-            if (!FindSource(sourceEntity->GetID())) {
-                Warn("FG_R lists an object that has no FG_M/FG_L/FG_S row: " + SafeName(sourceEntity));
+            const CK_ID id = sourceEntity->GetID();
+            if (!seen.insert(id).second) {
                 continue;
             }
 
-            rRow.sourceIds.push_back(sourceEntity->GetID());
-            rRow.sourceNames.push_back(SafeName(sourceEntity));
-        }
-
-        if (rRow.sourceIds.empty()) {
-            Warn("FG_R row " + std::to_string(row) + " has no valid source objects");
-        }
-
-        std::string list;
-        for (const std::string &name : rRow.sourceNames) {
-            if (!list.empty()) {
-                list += ", ";
+            auto builtinSource = sourceIndex.find(id);
+            auto customSource = cFieldIndex.find(id);
+            auto forbiddenU = uObjects.find(id);
+            if (builtinSource != sourceIndex.end()) {
+                SourceRef ref;
+                ref.kind = SourceRef::Builtin;
+                ref.index = builtinSource->second;
+                local.sources.push_back(ref);
+                names.push_back(SafeName(sourceEntity));
+            } else if (customSource != cFieldIndex.end()) {
+                const CFieldRow &field = m_Scan.cFields[static_cast<size_t>(customSource->second)];
+                if (!field.compiled.valid) {
+                    Warn("FG_Local references a rejected FG_CField: " + field.displayName);
+                    continue;
+                }
+                SourceRef ref;
+                ref.kind = SourceRef::Custom;
+                ref.index = customSource->second;
+                local.sources.push_back(ref);
+                names.push_back(field.displayName);
+            } else if (forbiddenU != uObjects.end()) {
+                Warn("FG_Local uses a uniform field (FG_UField) as a source, which is not allowed: " +
+                     SafeName(sourceEntity));
+                continue;
+            } else {
+                Warn("FG_Local row " + std::to_string(row) + " column " +
+                     std::to_string(column) + " is not a known source: " +
+                     SafeName(sourceEntity));
+                continue;
             }
-            list += name;
         }
-        m_Scan.rRows.push_back(rRow);
-        LogInfo("  FG_R row[%d]: region=%s -> [%s]", row, rRow.regionName.c_str(), list.c_str());
+
+        const std::string regionName = local.regionKind == LocalRow::BuiltinRegion
+                                               ? SafeName(regionEntity)
+                                               : m_Scan.cRegions[static_cast<size_t>(local.cRegionIndex)]
+                                                         .displayName;
+        LogInfo("  FG_Local row[%d]: region=%s -> [%s]", row, regionName.c_str(),
+                JoinNames(names).c_str());
+        m_Scan.localRows.push_back(std::move(local));
     }
 }
 
-void FlexGravityMod::ScanRGArray() {
-    CKDataArray *array = FindArray(kArrayRG);
+void FlexGravityMod::ScanGlobalArray(const std::unordered_map<CK_ID, int> &sourceIndex,
+                                     const std::unordered_map<CK_ID, int> &cFieldIndex,
+                                     const std::unordered_set<CK_ID> &uObjects) {
+    CKDataArray *array = FindArray(kArrayGlobal);
     if (!array) {
-        LogInfo("Array FG_RG not present; no global source list");
+        Warn("Array not found: FG_Global");
         return;
     }
 
-    m_Scan.rgArray.present = true;
-    m_Scan.rgArray.rows = array->GetRowCount();
-    m_Scan.rgArray.columns = array->GetColumnCount();
-    LogArrayColumns(array, kArrayRG);
+    m_Scan.globalArray.present = true;
+    m_Scan.globalArray.rows = array->GetRowCount();
+    m_Scan.globalArray.columns = array->GetColumnCount();
+    LogArrayColumns(array, kArrayGlobal);
 
     std::unordered_set<CK_ID> seen;
-    for (int row = 0; row < m_Scan.rgArray.rows; ++row) {
-        for (int column = 0; column < m_Scan.rgArray.columns; ++column) {
-            CKObject *cellObject = GetCellObject(array, row, column);
-            if (!cellObject) {
+    std::vector<std::string> names;
+    for (int row = 0; row < m_Scan.globalArray.rows; ++row) {
+        for (int column = 0; column < m_Scan.globalArray.columns; ++column) {
+            CKObject *cell = GetCellObject(array, row, column);
+            if (!cell) {
+                continue;
+            }
+            CK3dEntity *sourceEntity = CK3dEntity::Cast(cell);
+            if (!sourceEntity) {
+                Warn("FG_Global row " + std::to_string(row) + " column " +
+                     std::to_string(column) + " is not a 3D entity: " + ObjectText(cell));
                 continue;
             }
 
-            CK3dEntity *entity = CK3dEntity::Cast(cellObject);
-            if (!entity) {
-                Warn("FG_RG row " + std::to_string(row) + " column " + std::to_string(column) +
-                     " is not a 3D entity: " + ObjectText(cellObject));
+            const CK_ID id = sourceEntity->GetID();
+            if (!seen.insert(id).second) {
                 continue;
             }
 
-            if (!seen.insert(entity->GetID()).second) {
-                continue;
+            auto builtinSource = sourceIndex.find(id);
+            auto customSource = cFieldIndex.find(id);
+            if (builtinSource != sourceIndex.end()) {
+                SourceRef ref;
+                ref.kind = SourceRef::Builtin;
+                ref.index = builtinSource->second;
+                m_Scan.globalSources.push_back(ref);
+                names.push_back(SafeName(sourceEntity));
+            } else if (customSource != cFieldIndex.end()) {
+                const CFieldRow &field = m_Scan.cFields[static_cast<size_t>(customSource->second)];
+                if (!field.compiled.valid) {
+                    Warn("FG_Global references a rejected FG_CField: " + field.displayName);
+                    continue;
+                }
+                SourceRef ref;
+                ref.kind = SourceRef::Custom;
+                ref.index = customSource->second;
+                m_Scan.globalSources.push_back(ref);
+                names.push_back(field.displayName);
+            } else if (uObjects.find(id) != uObjects.end()) {
+                Warn("FG_Global uses a uniform field (FG_UField) as a source, which is not allowed: " +
+                     SafeName(sourceEntity));
+            } else {
+                Warn("FG_Global row " + std::to_string(row) + " column " +
+                     std::to_string(column) + " is not a known source: " +
+                     SafeName(sourceEntity));
             }
-            if (!FindSource(entity->GetID())) {
-                Warn("FG_RG lists an object that has no FG_M/FG_L/FG_S row: " + SafeName(entity));
-                continue;
-            }
-
-            m_Scan.globalSourceIds.push_back(entity->GetID());
-            m_Scan.globalSourceNames.push_back(SafeName(entity));
-            LogInfo("  FG_RG row[%d] col[%d]: %s", row, column, SafeName(entity).c_str());
         }
+    }
+
+    if (!names.empty()) {
+        LogInfo("FG_Global: [%s]", JoinNames(names).c_str());
     }
 }
 
-const SourceInfo *FlexGravityMod::FindSource(CK_ID objectId) const {
-    for (const SourceInfo &source : m_Scan.sources) {
-        if (source.objectId == objectId) {
-            return &source;
-        }
-    }
-    return nullptr;
-}
-
-void FlexGravityMod::ValidateMembership(const std::unordered_map<CK_ID, std::string> &uGroupMembers,
-                                        const std::unordered_map<CK_ID, std::string> &mGroupMembers,
-                                        const std::unordered_map<CK_ID, std::string> &lGroupMembers,
-                                        const std::unordered_map<CK_ID, std::string> &sGroupMembers,
-                                        const std::unordered_map<CK_ID, std::string> &rGroupMembers) {
+void FlexGravityMod::ValidateMembership(
+        const std::unordered_map<CK_ID, std::string> &uGroupMembers,
+        const std::unordered_map<CK_ID, std::string> &mGroupMembers,
+        const std::unordered_map<CK_ID, std::string> &lGroupMembers,
+        const std::unordered_map<CK_ID, std::string> &sGroupMembers,
+        const std::unordered_map<CK_ID, std::string> &cFieldGroupMembers,
+        const std::unordered_map<CK_ID, std::string> &cRegionGroupMembers) {
     std::unordered_set<CK_ID> uConfigured;
     for (const UFieldInfo &field : m_Scan.uFields) {
         uConfigured.insert(field.objectId);
     }
     for (const auto &entry : uGroupMembers) {
         if (uConfigured.find(entry.first) == uConfigured.end()) {
-            Warn("FG_U group member has no FG_U array row: " + entry.second);
+            Warn("FG_UField group member has no FG_UField array row: " + entry.second);
         }
     }
 
@@ -395,145 +734,41 @@ void FlexGravityMod::ValidateMembership(const std::unordered_map<CK_ID, std::str
 
     for (const auto &entry : mGroupMembers) {
         if (mConfigured.find(entry.first) == mConfigured.end()) {
-            Warn("FG_M group member has no FG_M array row: " + entry.second);
+            Warn("FG_MField group member has no FG_MField array row: " + entry.second);
         }
     }
     for (const auto &entry : lGroupMembers) {
         if (lConfigured.find(entry.first) == lConfigured.end()) {
-            Warn("FG_L group member has no FG_L array row: " + entry.second);
+            Warn("FG_LField group member has no FG_LField array row: " + entry.second);
         }
     }
     for (const auto &entry : sGroupMembers) {
         if (sConfigured.find(entry.first) == sConfigured.end()) {
-            Warn("FG_S group member has no FG_S array row: " + entry.second);
+            Warn("FG_SField group member has no FG_SField array row: " + entry.second);
         }
     }
 
-    std::unordered_set<CK_ID> rConfigured;
-    for (const RRowInfo &row : m_Scan.rRows) {
-        rConfigured.insert(row.regionObjectId);
+    std::unordered_set<CK_ID> cFieldConfigured;
+    for (const CFieldRow &field : m_Scan.cFields) {
+        cFieldConfigured.insert(field.objectId);
     }
-    for (const auto &entry : rGroupMembers) {
-        if (rConfigured.find(entry.first) == rConfigured.end()) {
-            Warn("FG_R group member has no FG_R array row: " + entry.second);
-        }
-    }
-}
-
-// FG_Custom is a pure data array: no group, no object column, and the Domain is
-// the only thing that decides whether a row applies.  Every row is compiled here
-// (once per level), never per frame.
-void FlexGravityMod::ScanCustomArray() {
-    CKDataArray *array = FindArray(kArrayCustom);
-    if (!array) {
-        LogInfo("Array FG_Custom not present");
-        return;
-    }
-
-    m_Scan.customArray.present = true;
-    m_Scan.customArray.rows = array->GetRowCount();
-    m_Scan.customArray.columns = array->GetColumnCount();
-    LogArrayColumns(array, kArrayCustom);
-
-    static const char *const kComponentColumns[6] = {"X", "Y", "Z", "R", "Theta", "Phi"};
-
-    const int nameColumn = FindColumn(array, "Name");
-    const int modeColumn = FindColumn(array, "Mode");
-    const int domainColumn = FindColumn(array, "Domain");
-    int componentColumn[6] = {-1, -1, -1, -1, -1, -1};
-    for (int index = 0; index < 6; ++index) {
-        componentColumn[index] = FindColumn(array, kComponentColumns[index]);
-    }
-
-    if (nameColumn < 0) {
-        Warn("FG_Custom has no column named Name");
-    }
-    if (modeColumn < 0) {
-        LogInfo("FG_Custom has no Mode column; every row is rectangular (legacy layout)");
-    }
-    if (domainColumn < 0) {
-        Warn("FG_Custom has no column named Domain");
-    }
-    for (int index = 0; index < 6; ++index) {
-        if (componentColumn[index] < 0) {
-            Warn(std::string("FG_Custom has no column named ") + kComponentColumns[index]);
+    for (const auto &entry : cFieldGroupMembers) {
+        if (cFieldConfigured.find(entry.first) == cFieldConfigured.end()) {
+            Warn("FG_CField group member has no FG_CField array row: " +
+                 DisplayName(entry.second));
         }
     }
 
-    for (int row = 0; row < m_Scan.customArray.rows; ++row) {
-        CustomFieldInfo field;
-        bool anyText = false;
-
-        if (nameColumn >= 0 && GetCellString(array, row, nameColumn, field.name)) {
-            anyText = anyText || !field.name.empty();
-        }
-        for (int index = 0; index < 6; ++index) {
-            if (componentColumn[index] >= 0 &&
-                GetCellString(array, row, componentColumn[index], field.text[index])) {
-                anyText = anyText || !field.text[index].empty();
-            }
-        }
-        if (domainColumn >= 0 && GetCellString(array, row, domainColumn, field.domainText)) {
-            anyText = anyText || !field.domainText.empty();
-        }
-
-        if (!anyText) {
-            // The editor's table can end with empty rows; they are not an error.
-            LogInfo("  FG_Custom row[%d]: empty row, skipped", row);
-            continue;
-        }
-
-        int mode = 0;
-        const bool modeRead = modeColumn >= 0 && GetCellInt(array, row, modeColumn, mode);
-        if (modeRead && mode != 0 && mode != 1) {
-            Warn("FG_Custom row " + std::to_string(row) + " has Mode=" + std::to_string(mode) +
-                 "; using rectangular coordinates");
-            mode = 0;
-        }
-        field.mode = mode == 1 ? 1 : 0;
-
-        core::expr::CompileCustomField(field);
-
-        const int group = field.mode;
-        if (!field.valid) {
-            Warn("FG_Custom row " + std::to_string(row) + " \"" + field.name +
-                 "\" rejected: " + field.error);
-        } else {
-            for (int component = 0; component < 3; ++component) {
-                const int column = group * 3 + component;
-                if (field.text[column].empty()) {
-                    Warn("FG_Custom row " + std::to_string(row) + " \"" + field.name + "\": " +
-                         kComponentColumns[column] + " is empty, treated as 0");
-                }
-            }
-            if (!field.hasDomain) {
-                Warn("FG_Custom row " + std::to_string(row) + " \"" + field.name +
-                     "\" has no Domain, so it applies everywhere");
-            }
-        }
-
-        // The lengths prove the dynamic string read works, which is the one
-        // engine-side assumption of this feature.
-        std::string detail = "  FG_Custom row[" + std::to_string(row) + "]: \"" + field.name +
-                             "\" mode=" + std::to_string(field.mode);
-        for (int component = 0; component < 3; ++component) {
-            const int column = group * 3 + component;
-            detail += " ";
-            detail += kComponentColumns[column];
-            detail += "(len=" + std::to_string(field.text[column].size()) + ")=\"" +
-                      field.text[column] + "\"";
-        }
-        detail += " domain(len=" + std::to_string(field.domainText.size()) + ")=\"" +
-                  field.domainText + "\"";
-        if (!field.valid) {
-            detail += " [rejected: " + field.error + "]";
-        }
-        LogInfo("%s", detail.c_str());
-
-        m_Scan.customFields.push_back(field);
+    std::unordered_set<CK_ID> cRegionConfigured;
+    for (const CRegionRow &region : m_Scan.cRegions) {
+        cRegionConfigured.insert(region.objectId);
     }
-
-    LogInfo("FG_Custom: %zu row(s) parsed", m_Scan.customFields.size());
+    for (const auto &entry : cRegionGroupMembers) {
+        if (cRegionConfigured.find(entry.first) == cRegionConfigured.end()) {
+            Warn("FG_CRegion group member has no FG_CRegion array row: " +
+                 DisplayName(entry.second));
+        }
+    }
 }
 
 void FlexGravityMod::Scan() {
@@ -549,12 +784,14 @@ void FlexGravityMod::Scan() {
 
     // A normal Ballance level has no FlexGravity data at all.  Keep the log
     // quiet in that case instead of producing one warning per missing object.
+    // Old FG_* names are deliberately not checked: v2.1 does not read them.
     const bool anyFlexGravityData =
             FindGroup(kGroupU) || FindGroup(kGroupM) || FindGroup(kGroupL) ||
-            FindGroup(kGroupS) || FindGroup(kGroupR) ||
+            FindGroup(kGroupS) || FindGroup(kGroupRegion) || FindGroup(kGroupCField) ||
+            FindGroup(kGroupCRegion) ||
             FindArray(kArrayU) || FindArray(kArrayM) || FindArray(kArrayL) ||
-            FindArray(kArrayS) || FindArray(kArrayR) || FindArray(kArrayRG) ||
-            FindArray(kArrayCustom);
+            FindArray(kArrayS) || FindArray(kArrayCField) || FindArray(kArrayCRegion) ||
+            FindArray(kArrayLocal) || FindArray(kArrayGlobal);
     if (!anyFlexGravityData) {
         LogInfo("No FlexGravity data in this level");
         return;
@@ -564,39 +801,77 @@ void FlexGravityMod::Scan() {
     std::unordered_map<CK_ID, std::string> mGroupMembers;
     std::unordered_map<CK_ID, std::string> lGroupMembers;
     std::unordered_map<CK_ID, std::string> sGroupMembers;
-    std::unordered_map<CK_ID, std::string> rGroupMembers;
+    std::unordered_map<CK_ID, std::string> regionGroupMembers;
+    std::unordered_map<CK_ID, std::string> cFieldGroupMembers;
+    std::unordered_map<CK_ID, std::string> cRegionGroupMembers;
 
     ScanGroup(kGroupU, m_Scan.uGroup, uGroupMembers);
     ScanGroup(kGroupM, m_Scan.mGroup, mGroupMembers);
     ScanGroup(kGroupL, m_Scan.lGroup, lGroupMembers);
     ScanGroup(kGroupS, m_Scan.sGroup, sGroupMembers);
-    ScanGroup(kGroupR, m_Scan.rGroup, rGroupMembers);
+    ScanGroup(kGroupRegion, m_Scan.regionGroup, regionGroupMembers);
+    ScanGroup(kGroupCField, m_Scan.cFieldGroup, cFieldGroupMembers);
+    ScanGroup(kGroupCRegion, m_Scan.cRegionGroup, cRegionGroupMembers);
 
     ScanUArray(uGroupMembers);
     ScanSourceArray(SourceInfo::KindMonopole, kArrayM, "G", m_Scan.mArray, mGroupMembers);
     ScanSourceArray(SourceInfo::KindLine, kArrayL, "Lambda", m_Scan.lArray, lGroupMembers);
     ScanSourceArray(SourceInfo::KindSheet, kArrayS, "Sigma", m_Scan.sArray, sGroupMembers);
-    ScanRArray(rGroupMembers);
-    ScanRGArray();
-    ScanCustomArray();
+    ScanRegionGroup(regionGroupMembers);
+    ScanCFieldArray(cFieldGroupMembers);
+    ScanCRegionArray(cRegionGroupMembers);
 
-    ValidateMembership(uGroupMembers, mGroupMembers, lGroupMembers, sGroupMembers, rGroupMembers);
+    // Object -> row indices, used by FG_Local / FG_Global and by the runtime.
+    std::unordered_map<CK_ID, int> sourceIndex;
+    for (size_t index = 0; index < m_Scan.sources.size(); ++index) {
+        sourceIndex[m_Scan.sources[index].objectId] = static_cast<int>(index);
+    }
+    std::unordered_map<CK_ID, int> regionIndex;
+    for (size_t index = 0; index < m_Scan.regions.size(); ++index) {
+        regionIndex[m_Scan.regions[index].objectId] = static_cast<int>(index);
+    }
+    std::unordered_map<CK_ID, int> cFieldIndex;
+    for (size_t index = 0; index < m_Scan.cFields.size(); ++index) {
+        cFieldIndex[m_Scan.cFields[index].objectId] = static_cast<int>(index);
+    }
+    std::unordered_map<CK_ID, int> cRegionIndex;
+    for (size_t index = 0; index < m_Scan.cRegions.size(); ++index) {
+        cRegionIndex[m_Scan.cRegions[index].objectId] = static_cast<int>(index);
+    }
+    std::unordered_set<CK_ID> uObjects;
+    for (const UFieldInfo &field : m_Scan.uFields) {
+        uObjects.insert(field.objectId);
+    }
 
-    LogInfo("Scan summary: groups(U=%d M=%d L=%d S=%d R=%d) "
-            "arrays(U=%d M=%d L=%d S=%d R=%d RG=%d) "
-            "fields(U=%zu M=%zu L=%zu S=%zu RRows=%zu Global=%zu Custom=%zu) warnings=%zu",
-            m_Scan.uGroup.count, m_Scan.mGroup.count, m_Scan.lGroup.count,
-            m_Scan.sGroup.count, m_Scan.rGroup.count,
-            m_Scan.uArray.rows, m_Scan.mArray.rows, m_Scan.lArray.rows,
-            m_Scan.sArray.rows, m_Scan.rArray.rows, m_Scan.rgArray.rows,
-            m_Scan.uFields.size(),
+    ScanLocalArray(regionIndex, cRegionIndex, sourceIndex, cFieldIndex, uObjects);
+    ScanGlobalArray(sourceIndex, cFieldIndex, uObjects);
+
+    ValidateMembership(uGroupMembers, mGroupMembers, lGroupMembers, sGroupMembers,
+                       cFieldGroupMembers, cRegionGroupMembers);
+
+    LogInfo("Scan summary: groups(UField=%d MField=%d LField=%d SField=%d Region=%d "
+            "CField=%d CRegion=%d) arrays(UField=%d MField=%d LField=%d SField=%d "
+            "CField=%d CRegion=%d Local=%d Global=%d) "
+            "fields(U=%zu M=%zu L=%zu S=%zu Regions=%zu Local=%zu Global=%zu "
+            "CField=%zu CRegion=%zu) ignored=%d warnings=%zu",
+            m_Scan.uGroup.count, m_Scan.mGroup.count, m_Scan.lGroup.count, m_Scan.sGroup.count,
+            m_Scan.regionGroup.count, m_Scan.cFieldGroup.count, m_Scan.cRegionGroup.count,
+            m_Scan.uArray.rows, m_Scan.mArray.rows, m_Scan.lArray.rows, m_Scan.sArray.rows,
+            m_Scan.cFieldArray.rows, m_Scan.cRegionArray.rows, m_Scan.localArray.rows,
+            m_Scan.globalArray.rows, m_Scan.uFields.size(),
             static_cast<size_t>(std::count_if(m_Scan.sources.begin(), m_Scan.sources.end(),
-                                             [](const SourceInfo &s) { return s.kind == SourceInfo::KindMonopole; })),
+                                              [](const SourceInfo &s) {
+                                                  return s.kind == SourceInfo::KindMonopole;
+                                              })),
             static_cast<size_t>(std::count_if(m_Scan.sources.begin(), m_Scan.sources.end(),
-                                             [](const SourceInfo &s) { return s.kind == SourceInfo::KindLine; })),
+                                              [](const SourceInfo &s) {
+                                                  return s.kind == SourceInfo::KindLine;
+                                              })),
             static_cast<size_t>(std::count_if(m_Scan.sources.begin(), m_Scan.sources.end(),
-                                             [](const SourceInfo &s) { return s.kind == SourceInfo::KindSheet; })),
-            m_Scan.rRows.size(), m_Scan.globalSourceIds.size(), m_Scan.customFields.size(),
+                                              [](const SourceInfo &s) {
+                                                  return s.kind == SourceInfo::KindSheet;
+                                              })),
+            m_Scan.regions.size(), m_Scan.localRows.size(), m_Scan.globalSources.size(),
+            m_Scan.cFields.size(), m_Scan.cRegions.size(), m_Scan.ignoredEntries,
             m_Scan.warnings.size());
 }
-

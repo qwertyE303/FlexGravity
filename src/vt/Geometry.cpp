@@ -272,13 +272,13 @@ bool FlexGravityMod::BuildLineGeometry(SourceInfo &source, CK3dEntity *entity) {
                 source.closed = SafeCurveIsOpen(curve) == 0;
                 source.geometryValid = source.localPoints.size() >= 2;
             } else {
-                Warn("FG_L curve control point query failed: " + SafeName(entity));
+                Warn("FG_LField curve control point query failed: " + SafeName(entity));
             }
         } else if (count >= 0) {
-            Warn("FG_L curve has an unusable control point count: " + SafeName(entity) +
+            Warn("FG_LField curve has an unusable control point count: " + SafeName(entity) +
                  " count=" + std::to_string(count));
         } else {
-            Warn("FG_L curve probe raised an exception; falling back to bounding box: " +
+            Warn("FG_LField curve probe raised an exception; falling back to bounding box: " +
                  SafeName(entity));
         }
     }
@@ -287,7 +287,7 @@ bool FlexGravityMod::BuildLineGeometry(SourceInfo &source, CK3dEntity *entity) {
         // Fallback: the longest local bounding box axis becomes the segment.
         VxBbox box = entity->GetBoundingBox(TRUE);
         if (!box.IsValid()) {
-            Warn("FG_L has no usable curve or bounding box: " + SafeName(entity));
+            Warn("FG_LField has no usable curve or bounding box: " + SafeName(entity));
             return false;
         }
 
@@ -310,7 +310,7 @@ bool FlexGravityMod::BuildLineGeometry(SourceInfo &source, CK3dEntity *entity) {
         source.localPoints.push_back(a);
         source.localPoints.push_back(b);
         source.geometryValid = true;
-        LogWarn("FG_L is not a curve; using the longest bounding box axis: %s", SafeName(entity).c_str());
+        LogWarn("FG_LField is not a curve; using the longest bounding box axis: %s", SafeName(entity).c_str());
     }
 
     return source.geometryValid;
@@ -380,14 +380,14 @@ bool FlexGravityMod::BuildSheetGeometry(SourceInfo &source, CK3dEntity *entity) 
                     return true;
                 }
             }
-            Warn("FG_S mesh has no usable triangles: " + SafeName(entity));
+            Warn("FG_SField mesh has no usable triangles: " + SafeName(entity));
         }
     }
 
     // Fallback: no mesh, treat the local bounding box as one rectangle.
     VxBbox box = entity->GetBoundingBox(TRUE);
     if (!box.IsValid()) {
-        Warn("FG_S has no usable mesh or bounding box: " + SafeName(entity));
+        Warn("FG_SField has no usable mesh or bounding box: " + SafeName(entity));
         return false;
     }
 
@@ -407,11 +407,11 @@ bool FlexGravityMod::BuildSheetGeometry(SourceInfo &source, CK3dEntity *entity) 
     const float thickness = GetComponent(size, normalAxis);
 
     if (extentA <= 1.0e-4f || extentB <= 1.0e-4f) {
-        Warn("FG_S bounding box is degenerate: " + SafeName(entity));
+        Warn("FG_SField bounding box is degenerate: " + SafeName(entity));
         return false;
     }
     if (thickness > 0.5f * (std::max)(extentA, extentB)) {
-        Warn("FG_S object does not look flat: " + SafeName(entity) + " size=" + FormatVec(size));
+        Warn("FG_SField object does not look flat: " + SafeName(entity) + " size=" + FormatVec(size));
     }
 
     source.localCenter = Scale(Add(box.Min, box.Max), 0.5f);
@@ -422,7 +422,7 @@ bool FlexGravityMod::BuildSheetGeometry(SourceInfo &source, CK3dEntity *entity) 
     source.halfB = extentB * 0.5f;
     source.geometryValid = true;
 
-    LogWarn("FG_S has no usable mesh; using its bounding box rectangle: %s",
+    LogWarn("FG_SField has no usable mesh; using its bounding box rectangle: %s",
             SafeName(entity).c_str());
     return true;
 }

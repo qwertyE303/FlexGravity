@@ -5,35 +5,37 @@
 // Total acceleration at an arbitrary world point, for the debug overlay.
 //
 // This is the physics rule of UpdateFields with the body replaced by a
-// zero-mass probe: vanilla gravity, plus every FG_U whose region contains the
-// point, plus every field source that is active at the point (FG_RG, or an
-// FG_R row whose region contains the point).  The physics path never calls
-// this, so a probe can never change what a body feels.
+// zero-mass probe: vanilla gravity, plus every FG_UField whose region contains
+// the point, plus every source active through FG_Global / FG_Local.  CFields
+// are ordinary sources now, so they are included exactly where the physics
+// path includes them.  The physics path never calls this, so a probe can never
+// change what a body feels.
 VxVector FlexGravityMod::SampleFieldAtPoint(const VxVector &worldPoint) {
     VxVector acceleration = core::kVanillaGravity;
     if (!m_Scan.ran) {
         return acceleration;
     }
 
-    const size_t regionCount = m_Scan.uFields.size() + m_Scan.rRows.size();
-    if (m_RegionValid.size() < regionCount || m_RegionInverse.size() < regionCount) {
+    if (m_UFieldValid.size() < m_Scan.uFields.size() || m_RegionValid.size() < m_Scan.regions.size() ||
+        m_SourceValid.size() < m_Scan.sources.size()) {
         // Nothing has evaluated the fields yet this level: the caches are built
         // by RefreshFieldTransforms, which only runs inside UpdateFields.
         RefreshFieldTransforms();
     }
 
-    for (size_t index = 0; index < m_Scan.uFields.size() && index < m_RegionValid.size(); ++index) {
-        if (!m_RegionValid[index]) {
+    for (size_t index = 0; index < m_Scan.uFields.size() && index < m_UFieldValid.size(); ++index) {
+        if (!m_UFieldValid[index]) {
             continue;
         }
-        if (PointInsideRegion(m_Scan.uFields[index].region, m_RegionInverse[index], worldPoint)) {
+        if (PointInsideRegion(m_Scan.uFields[index].region, m_UFieldInverse[index], worldPoint)) {
             acceleration = Add(acceleration, m_Scan.uFields[index].gravity);
         }
     }
 
-    if (!m_Scan.sources.empty() || !m_Scan.customFields.empty()) {
-        acceleration =
-                Add(acceleration, EvaluateActiveFieldsAtPoint(worldPoint, m_VizRows, m_VizSources));
+    if (!m_Scan.localRows.empty() || !m_Scan.globalSources.empty() || !m_Scan.cFields.empty()) {
+        acceleration = Add(acceleration,
+                           EvaluateActiveFieldsAtPoint(worldPoint, m_VizRows, m_VizSources,
+                                                       m_VizCFields));
     }
     return acceleration;
 }
@@ -43,10 +45,10 @@ VxVector FlexGravityMod::SampleFieldAtPoint(const VxVector &worldPoint) {
 // activation rule, so a surface of constant Phi always crosses the field lines
 // at a right angle.
 //
-// FG_Custom rows are NOT part of this: an arbitrary expression vector field has
-// no potential in general, and inventing one (a path integral) would draw
-// surfaces that disagree with the physics.  The arrow and the field lines do
-// include them, because they only need the acceleration.
+// CFields are NOT part of this: an arbitrary expression vector field has no
+// potential in general, and inventing one (a path integral) would draw surfaces
+// that disagree with the physics.  The arrow and the field lines do include
+// them, because they only need the acceleration.
 float FlexGravityMod::PotentialAtPoint(const VxVector &worldPoint) {
     // A uniform acceleration g has potential -g . p; the constant is irrelevant
     // because only differences between lattice samples matter.
@@ -55,74 +57,100 @@ float FlexGravityMod::PotentialAtPoint(const VxVector &worldPoint) {
         return potential;
     }
 
-    const size_t regionCount = m_Scan.uFields.size() + m_Scan.rRows.size();
-    if (m_RegionValid.size() < regionCount || m_RegionInverse.size() < regionCount) {
+    if (m_UFieldValid.size() < m_Scan.uFields.size() || m_RegionValid.size() < m_Scan.regions.size()) {
         RefreshFieldTransforms();
     }
 
-    for (size_t index = 0; index < m_Scan.uFields.size() && index < m_RegionValid.size(); ++index) {
-        if (!m_RegionValid[index]) {
+    for (size_t index = 0; index < m_Scan.uFields.size() && index < m_UFieldValid.size(); ++index) {
+        if (!m_UFieldValid[index]) {
             continue;
         }
-        if (PointInsideRegion(m_Scan.uFields[index].region, m_RegionInverse[index], worldPoint)) {
+        if (PointInsideRegion(m_Scan.uFields[index].region, m_UFieldInverse[index], worldPoint)) {
             potential -= core::Dot(m_Scan.uFields[index].gravity, worldPoint);
         }
     }
 
-    if (!m_Scan.sources.empty()) {
-        potential += EvaluateSourcePotentialsAtPoint(worldPoint, m_VizRows, m_VizSources);
+    if (!m_Scan.localRows.empty() || !m_Scan.globalSources.empty()) {
+        potential += EvaluateSourcePotentialsAtPoint(worldPoint, m_VizRows, m_VizSources,
+                                                     m_VizCFields);
     }
     return potential;
 }
 
-// Potential counterpart of EvaluateActiveFieldsAtPoint: identical activation mask,
-// identical dispatch, summed as scalars instead of accelerations.  FG_Custom rows
-// are absent here on purpose (see PotentialAtPoint).
+// Potential counterpart of EvaluateActiveFieldsAtPoint: identical activation
+// mask, identical dispatch, summed as scalars instead of accelerations.
+// CFields are absent here on purpose (see PotentialAtPoint).
 float FlexGravityMod::EvaluateSourcePotentialsAtPoint(const VxVector &point,
                                                       std::vector<char> &rowTouched,
-                                                      std::vector<char> &sourceMask) {
+                                                      std::vector<char> &sourceMask,
+                                                      std::vector<char> &cFieldMask) {
+    (void) cFieldMask;
     float potential = 0.0f;
-    if (m_Scan.sources.empty()) {
+    if (m_Scan.localRows.empty() && m_Scan.globalSources.empty()) {
+        return potential;
+    }
+    if (m_SourceValid.size() < m_Scan.sources.size() || m_RegionValid.size() < m_Scan.regions.size()) {
         return potential;
     }
 
-    const size_t regionCount = m_Scan.uFields.size() + m_Scan.rRows.size();
-    if (m_RegionValid.size() < regionCount || m_RegionInverse.size() < regionCount ||
-        m_SourceValid.size() < m_Scan.sources.size() || m_SourceLines.size() < m_Scan.sources.size() ||
-        m_SourceSheets.size() < m_Scan.sources.size() || m_SourceWorld.size() < m_Scan.sources.size()) {
-        return potential;
-    }
-    if (rowTouched.size() != m_Scan.rRows.size()) {
-        rowTouched.assign(m_Scan.rRows.size(), 0);
+    if (rowTouched.size() != m_Scan.localRows.size()) {
+        rowTouched.assign(m_Scan.localRows.size(), 0);
     }
     if (sourceMask.size() != m_Scan.sources.size()) {
         sourceMask.assign(m_Scan.sources.size(), 0);
     }
 
-    for (size_t index = 0; index < m_Scan.rRows.size(); ++index) {
-        const size_t regionIndex = m_Scan.uFields.size() + index;
-        rowTouched[index] =
-                (m_RegionValid[regionIndex] &&
-                 PointInsideRegion(m_Scan.rRows[index].region, m_RegionInverse[regionIndex], point))
-                ? 1
-                : 0;
+    const bool needFrame = !m_Scan.cRegions.empty();
+    PointFrame frame{};
+    bool frameReady = false;
+    const auto ensureFrame = [&]() {
+        if (!frameReady) {
+            frame = core::expr::MakePointFrame(point);
+            frameReady = true;
+        }
+    };
+
+    for (size_t index = 0; index < m_Scan.localRows.size(); ++index) {
+        const LocalRow &row = m_Scan.localRows[index];
+        bool touched = false;
+        if (row.regionKind == LocalRow::BuiltinRegion) {
+            if (row.regionIndex >= 0 &&
+                row.regionIndex < static_cast<int>(m_RegionValid.size()) &&
+                m_RegionValid[static_cast<size_t>(row.regionIndex)]) {
+                const size_t region = static_cast<size_t>(row.regionIndex);
+                touched = PointInsideRegion(m_Scan.regions[region].volume, m_RegionInverse[region],
+                                            point);
+            }
+        } else if (row.cRegionIndex >= 0 &&
+                   row.cRegionIndex < static_cast<int>(m_Scan.cRegions.size())) {
+            const CRegionRow &region = m_Scan.cRegions[static_cast<size_t>(row.cRegionIndex)];
+            if (region.valid) {
+                ensureFrame();
+                bool nonFinite = false;
+                touched = core::expr::EvaluateDomain(region.domain, frame.variables, &nonFinite);
+                if (nonFinite) {
+                    touched = false;
+                }
+            }
+        }
+        rowTouched[index] = touched ? 1 : 0;
     }
 
     std::fill(sourceMask.begin(), sourceMask.end(), 0);
-    for (CK_ID sourceId : m_Scan.globalSourceIds) {
-        auto it = m_SourceIndex.find(sourceId);
-        if (it != m_SourceIndex.end()) {
-            sourceMask[it->second] = 1;
+    for (const SourceRef &ref : m_Scan.globalSources) {
+        if (ref.kind == SourceRef::Builtin && ref.index >= 0 &&
+            ref.index < static_cast<int>(sourceMask.size())) {
+            sourceMask[static_cast<size_t>(ref.index)] = 1;
         }
     }
     for (size_t row = 0; row < rowTouched.size(); ++row) {
         if (!rowTouched[row]) {
             continue;
         }
-        for (CK_ID sourceId : m_Scan.rRows[row].sourceIds) {
-            auto it = m_SourceIndex.find(sourceId);
-            if (it != m_SourceIndex.end()) {
-                sourceMask[it->second] = 1;
+        for (const SourceRef &ref : m_Scan.localRows[row].sources) {
+            if (ref.kind == SourceRef::Builtin && ref.index >= 0 &&
+                ref.index < static_cast<int>(sourceMask.size())) {
+                sourceMask[static_cast<size_t>(ref.index)] = 1;
             }
         }
     }

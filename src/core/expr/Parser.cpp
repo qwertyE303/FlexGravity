@@ -23,6 +23,9 @@ enum class TokenKind {
     RParen,
     Comma,
     RelOp,
+    And,
+    Or,
+    Not,
     End
 };
 
@@ -130,8 +133,18 @@ bool Tokenize(const std::string &text, std::vector<Token> &tokens, CompileError 
                 ++index;
             }
             Token token;
-            token.kind = TokenKind::Identifier;
             token.text = Lowercase(text.substr(start, index - start));
+            // Domain keywords are reserved everywhere: `1 and y` must not turn
+            // into `1*and*y`, and a field column may not use them as names.
+            if (token.text == "and") {
+                token.kind = TokenKind::And;
+            } else if (token.text == "or") {
+                token.kind = TokenKind::Or;
+            } else if (token.text == "not") {
+                token.kind = TokenKind::Not;
+            } else {
+                token.kind = TokenKind::Identifier;
+            }
             token.position = static_cast<int>(start);
             tokens.push_back(token);
             continue;
@@ -190,7 +203,23 @@ bool Tokenize(const std::string &text, std::vector<Token> &tokens, CompileError 
                 index += 2;
                 break;
             }
-            return FailAt(error, "there is no '!' operator; use abs(x) for the absolute value", index);
+            token.kind = TokenKind::Not;
+            ++index;
+            break;
+        case '&':
+            if (index + 1 < size && text[index + 1] == '&') {
+                token.kind = TokenKind::And;
+                index += 2;
+                break;
+            }
+            return FailAt(error, "use 'and' or '&&' for logical AND", index);
+        case '|':
+            if (index + 1 < size && text[index + 1] == '|') {
+                token.kind = TokenKind::Or;
+                index += 2;
+                break;
+            }
+            return FailAt(error, "use 'or' or '||' for logical OR", index);
         case '<':
             if (index + 1 < size && text[index + 1] == '=') {
                 token.kind = TokenKind::RelOp;
@@ -245,6 +274,14 @@ bool InsertImplicitMultiplication(const std::vector<Token> &tokens, std::vector<
         const Token &current = tokens[index];
         if (index > 0) {
             const Token &previous = tokens[index - 1];
+            // `and` / `or` / `not` are keywords, never values: never glue them
+            // to a neighbouring value with an implicit '*'.
+            if (current.kind == TokenKind::And || current.kind == TokenKind::Or ||
+                current.kind == TokenKind::Not || previous.kind == TokenKind::And ||
+                previous.kind == TokenKind::Or || previous.kind == TokenKind::Not) {
+                expanded.push_back(current);
+                continue;
+            }
             bool insert = false;
             switch (previous.kind) {
             case TokenKind::Number:
@@ -287,10 +324,17 @@ bool InsertImplicitMultiplication(const std::vector<Token> &tokens, std::vector<
 
 class Parser {
 public:
-    Parser(const std::vector<Token> &tokens, unsigned variableMask, CompileError &error)
-        : m_tokens(tokens), m_mask(variableMask), m_error(error) {}
+    Parser(const std::vector<Token> &tokens, unsigned variableMask, CompileError &error,
+           size_t &index)
+        : m_tokens(tokens), m_mask(variableMask), m_error(error), m_index(index) {}
 
-    bool ParseExpression(Program &out) {
+    // Parses one arithmetic expression starting at the shared cursor and leaves
+    // the cursor on the first token that does not belong to it.  Domain reuses
+    // this for the two sides of every comparison.
+    bool ParseArithmetic(Program &out) {
+        if (!m_error.ok) {
+            return false;
+        }
         m_program = Program{};
         m_depth = 0;
         m_maxDepth = 0;
@@ -308,6 +352,9 @@ public:
     const Token &Current() const { return m_tokens[m_index]; }
 
     bool AtEnd() const { return Current().kind == TokenKind::End; }
+
+    size_t Index() const { return m_index; }
+    void SetIndex(size_t index) { m_index = index; }
 
     void Advance() {
         if (m_index + 1 < m_tokens.size()) {
@@ -489,6 +536,11 @@ private:
             return Fail("relation operators (= != < <= > >=) are only allowed in Domain",
                         token.position);
 
+        case TokenKind::And:
+        case TokenKind::Or:
+        case TokenKind::Not:
+            return Fail("'and' / 'or' / 'not' are only allowed in Domain", token.position);
+
         case TokenKind::End:
             return Fail("unexpected end of expression", token.position);
 
@@ -558,10 +610,191 @@ private:
     const std::vector<Token> &m_tokens;
     unsigned m_mask = kMaskAll;
     CompileError &m_error;
-    size_t m_index = 0;
+    size_t &m_index;
     Program m_program;
     int m_depth = 0;
     int m_maxDepth = 0;
+};
+
+// Boolean-domain parser on top of the arithmetic Parser.  `(x+1)>0` and
+// `(x>0)` both start with '(' — the first is a comparison whose left side is a
+// parenthesised arithmetic expression, the second is a parenthesised boolean.
+// Primary therefore tries the boolean group and backtracks to a comparison.
+class DomainParser {
+public:
+    DomainParser(Parser &arith, Domain &domain, CompileError &error)
+        : m_arith(arith), m_domain(domain), m_error(error) {}
+
+    bool Parse(int &root) { return ParseOr(root); }
+
+private:
+    bool Fail(const std::string &message) {
+        if (m_error.ok) {
+            m_error.ok = false;
+            m_error.message = message;
+            m_error.position = m_arith.Current().position;
+        }
+        return false;
+    }
+
+    int AddNode(const BoolNode &node) {
+        m_domain.nodes.push_back(node);
+        return static_cast<int>(m_domain.nodes.size()) - 1;
+    }
+
+    int AddCompare(Relation relation) {
+        m_domain.relations.push_back(std::move(relation));
+        BoolNode node;
+        node.kind = BoolKind::Compare;
+        node.a = static_cast<int>(m_domain.relations.size()) - 1;
+        return AddNode(node);
+    }
+
+    int AddBinary(BoolKind kind, int a, int b) {
+        BoolNode node;
+        node.kind = kind;
+        node.a = a;
+        node.b = b;
+        return AddNode(node);
+    }
+
+    bool TooLarge() const {
+        return m_domain.nodes.size() > static_cast<size_t>(kMaxDomainNodes);
+    }
+
+    bool ParseOr(int &out) {
+        int left = -1;
+        if (!ParseAnd(left)) {
+            return false;
+        }
+        while (m_arith.Current().kind == TokenKind::Or) {
+            m_arith.Advance();
+            int right = -1;
+            if (!ParseAnd(right)) {
+                return false;
+            }
+            left = AddBinary(BoolKind::Or, left, right);
+            if (TooLarge()) {
+                return Fail("Domain has too many terms");
+            }
+        }
+        out = left;
+        return true;
+    }
+
+    bool ParseAnd(int &out) {
+        int left = -1;
+        if (!ParseNot(left)) {
+            return false;
+        }
+        while (m_arith.Current().kind == TokenKind::And) {
+            m_arith.Advance();
+            int right = -1;
+            if (!ParseNot(right)) {
+                return false;
+            }
+            left = AddBinary(BoolKind::And, left, right);
+            if (TooLarge()) {
+                return Fail("Domain has too many terms");
+            }
+        }
+        out = left;
+        return true;
+    }
+
+    // `not` binds the comparison that follows it: `not x=1` is `not (x=1)`.
+    bool ParseNot(int &out) {
+        if (m_arith.Current().kind == TokenKind::Not) {
+            m_arith.Advance();
+            if (++m_depth > kMaxDomainDepth) {
+                return Fail("Domain is nested too deeply");
+            }
+            int child = -1;
+            const bool ok = ParseNot(child);
+            --m_depth;
+            if (!ok) {
+                return false;
+            }
+            BoolNode node;
+            node.kind = BoolKind::Not;
+            node.a = child;
+            out = AddNode(node);
+            return true;
+        }
+        return ParsePrimary(out);
+    }
+
+    bool ParsePrimary(int &out) {
+        if (m_arith.Current().kind == TokenKind::LParen) {
+            const size_t savedIndex = m_arith.Index();
+            const CompileError savedError = m_error;
+            const size_t savedNodes = m_domain.nodes.size();
+            const size_t savedRelations = m_domain.relations.size();
+
+            m_arith.Advance();
+            if (++m_depth > kMaxDomainDepth) {
+                --m_depth;
+                return Fail("Domain is nested too deeply");
+            }
+            int inner = -1;
+            const bool parsed = ParseOr(inner);
+            const bool closed = parsed && m_arith.Current().kind == TokenKind::RParen;
+            if (closed) {
+                m_arith.Advance();
+                // A comparison operator after ')' means the parentheses were
+                // arithmetic, not boolean: `(x+1) > 0`.
+                if (m_arith.Current().kind != TokenKind::RelOp) {
+                    --m_depth;
+                    out = inner;
+                    return true;
+                }
+            }
+            --m_depth;
+            m_arith.SetIndex(savedIndex);
+            m_error = savedError;
+            m_domain.nodes.resize(savedNodes);
+            m_domain.relations.resize(savedRelations);
+        }
+        return ParseComparison(out);
+    }
+
+    bool ParseComparison(int &out) {
+        Program left;
+        if (!m_arith.ParseArithmetic(left)) {
+            return false;
+        }
+        if (m_arith.Current().kind != TokenKind::RelOp) {
+            return Fail("expected one of = != < <= > >=");
+        }
+
+        int result = -1;
+        while (m_arith.Current().kind == TokenKind::RelOp) {
+            Relation relation;
+            relation.op = m_arith.Current().op;
+            m_arith.Advance();
+            relation.left = std::move(left);
+            if (!m_arith.ParseArithmetic(relation.right)) {
+                return false;
+            }
+            // A chained comparison keeps the previous right-hand side as the
+            // next left-hand side: 2 < x < 5  ==  (2 < x) and (x < 5).
+            Program next = relation.right;
+
+            const int node = AddCompare(std::move(relation));
+            result = result < 0 ? node : AddBinary(BoolKind::And, result, node);
+            if (TooLarge()) {
+                return Fail("Domain has too many terms");
+            }
+            left = std::move(next);
+        }
+        out = result;
+        return true;
+    }
+
+    Parser &m_arith;
+    Domain &m_domain;
+    CompileError &m_error;
+    int m_depth = 0;
 };
 
 bool CheckLength(const std::string &text, CompileError &error) {
@@ -594,8 +827,9 @@ bool CompileExpression(const std::string &text, unsigned variableMask, Program &
         return false;
     }
 
-    Parser parser(expanded, variableMask, error);
-    if (!parser.ParseExpression(program)) {
+    size_t index = 0;
+    Parser parser(expanded, variableMask, error, index);
+    if (!parser.ParseArithmetic(program)) {
         return false;
     }
     if (!parser.AtEnd()) {
@@ -615,6 +849,12 @@ bool CompileDomain(const std::string &text, Domain &domain, CompileError &error)
     error = CompileError{};
     domain = Domain{};
 
+    if (text.empty()) {
+        error.ok = false;
+        error.message = "Domain is empty";
+        error.position = 0;
+        return false;
+    }
     if (!CheckLength(text, error)) {
         return false;
     }
@@ -628,96 +868,95 @@ bool CompileDomain(const std::string &text, Domain &domain, CompileError &error)
         return false;
     }
 
-    Parser parser(expanded, kMaskAll, error);
-
-    while (true) {
-        Relation relation;
-        if (!parser.ParseExpression(relation.left)) {
-            return false;
-        }
-
-        const Token &op = parser.Current();
-        if (op.kind != TokenKind::RelOp) {
-            return parser.Fail("each relation needs one of = != < <= > >=", op.position);
-        }
-        relation.op = op.op;
-        const int opPosition = op.position;
-        parser.Advance();
-
-        if (!parser.ParseExpression(relation.right)) {
-            return false;
-        }
-        domain.relations.push_back(std::move(relation));
-
-        if (domain.relations.size() > static_cast<size_t>(kMaxRelations)) {
-            return parser.Fail("too many relations", opPosition);
-        }
-
-        if (parser.Current().kind == TokenKind::Comma) {
-            parser.Advance();
-            if (parser.Current().kind == TokenKind::End) {
-                return parser.Fail("empty relation after ','", parser.Current().position);
-            }
-            continue;
-        }
-        break;
+    size_t index = 0;
+    Parser parser(expanded, kMaskAll, error, index);
+    DomainParser domainParser(parser, domain, error);
+    int root = -1;
+    if (!domainParser.Parse(root)) {
+        return false;
     }
-
     if (!parser.AtEnd()) {
         const Token &token = parser.Current();
-        if (token.kind == TokenKind::RelOp) {
-            return parser.Fail("chained comparisons are not supported (use ',' for AND)",
-                               token.position);
+        if (token.kind == TokenKind::Comma) {
+            return parser.Fail("a comma no longer means AND; use 'and'", token.position);
         }
-        return parser.Fail("unexpected token after the last relation", token.position);
+        if (token.kind == TokenKind::Identifier) {
+            return parser.Fail("missing logical operator between terms", token.position);
+        }
+        return parser.Fail("unexpected token after the Domain expression", token.position);
     }
+    domain.root = root;
     return true;
 }
+
+namespace {
+
+bool RelationHolds(const Relation &relation, const double *variables, bool *nonFinite) {
+    const double left = EvaluateProgram(relation.left, variables);
+    const double right = EvaluateProgram(relation.right, variables);
+    if (!IsFinite(left) || !IsFinite(right)) {
+        if (nonFinite) {
+            *nonFinite = true;
+        }
+        return false;
+    }
+
+    switch (relation.op) {
+    case RelOp::Equal:
+        return std::fabs(left - right) <= 1e-6;
+    case RelOp::NotEqual:
+        return std::fabs(left - right) > 1e-6;
+    case RelOp::Less:
+        return left < right;
+    case RelOp::LessEqual:
+        return left <= right;
+    case RelOp::Greater:
+        return left > right;
+    case RelOp::GreaterEqual:
+        return left >= right;
+    }
+    return false;
+}
+
+bool EvaluateNode(const Domain &domain, int index, const double *variables, bool *nonFinite,
+                  int depth) {
+    if (index < 0 || index >= static_cast<int>(domain.nodes.size()) ||
+        depth > kMaxDomainDepth) {
+        return false;
+    }
+    const BoolNode &node = domain.nodes[static_cast<size_t>(index)];
+    switch (node.kind) {
+    case BoolKind::Compare:
+        if (node.a < 0 || node.a >= static_cast<int>(domain.relations.size())) {
+            return false;
+        }
+        return RelationHolds(domain.relations[static_cast<size_t>(node.a)], variables, nonFinite);
+    case BoolKind::And:
+        if (!EvaluateNode(domain, node.a, variables, nonFinite, depth + 1)) {
+            return false;
+        }
+        return EvaluateNode(domain, node.b, variables, nonFinite, depth + 1);
+    case BoolKind::Or:
+        if (EvaluateNode(domain, node.a, variables, nonFinite, depth + 1)) {
+            return true;
+        }
+        return EvaluateNode(domain, node.b, variables, nonFinite, depth + 1);
+    case BoolKind::Not:
+        return !EvaluateNode(domain, node.a, variables, nonFinite, depth + 1);
+    }
+    return false;
+}
+
+} // namespace
 
 bool EvaluateDomain(const Domain &domain, const double *variables, bool *nonFinite) {
     if (nonFinite) {
         *nonFinite = false;
     }
-    if (domain.relations.empty()) {
+    if (domain.root < 0) {
         return true;
     }
-
-    for (const Relation &relation : domain.relations) {
-        const double left = EvaluateProgram(relation.left, variables);
-        const double right = EvaluateProgram(relation.right, variables);
-        if (!IsFinite(left) || !IsFinite(right)) {
-            if (nonFinite) {
-                *nonFinite = true;
-            }
-            return false;
-        }
-
-        bool holds = false;
-        switch (relation.op) {
-        case RelOp::Equal:
-            holds = std::fabs(left - right) <= 1e-6;
-            break;
-        case RelOp::NotEqual:
-            holds = std::fabs(left - right) > 1e-6;
-            break;
-        case RelOp::Less:
-            holds = left < right;
-            break;
-        case RelOp::LessEqual:
-            holds = left <= right;
-            break;
-        case RelOp::Greater:
-            holds = left > right;
-            break;
-        case RelOp::GreaterEqual:
-            holds = left >= right;
-            break;
-        }
-        if (!holds) {
-            return false;
-        }
-    }
-    return true;
+    return EvaluateNode(domain, domain.root, variables, nonFinite, 0);
 }
 
 } // namespace fg::core::expr

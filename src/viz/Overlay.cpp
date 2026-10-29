@@ -4,9 +4,11 @@
 
 #include <imgui.h>
 
-// Debug overlay, drawn from OnRender: that is the only place where BML+ lets a
-// mod touch ImGui, and BML+ guarantees a frame is active there.  Everything is
-// diagnostic-only; with the master switch off OnRender is one comparison.
+// Debug overlay, drawn from OnProcess.  In BML 0.3.13 the frame order is
+// PreProcess(NewFrame) -> PostProcess(OnProcess) -> ImGui::Render() ->
+// OnPostRender(OnRender), so drawing in OnRender happens *after* the frame was
+// already submitted and is silently discarded.  OnProcess is the only place
+// that is inside the ImGui frame.
 //
 // BML+ owns the ImGui context, so every ImGui call below happens inside a
 // Bui::ImGuiContextScope.  Without it the current context in this DLL is
@@ -42,8 +44,7 @@ void AddShadowedText(ImDrawList *draw, const ImVec2 &position, const char *text)
 
 } // namespace
 
-void FlexGravityMod::OnRender(CK_RENDER_FLAGS flags) {
-    (void) flags;
+void FlexGravityMod::DrawOverlayFrame() {
     // DebugMode is the master switch: with it off nothing is drawn, whatever
     // the individual overlay switches say.
     if (!m_DebugMode || m_TearingDown || !m_BML) {
@@ -52,7 +53,12 @@ void FlexGravityMod::OnRender(CK_RENDER_FLAGS flags) {
     if (!m_ShowGVector && !m_EnableFieldLines && !m_EnableEquipotentials) {
         return;
     }
-    if (!m_BML->IsIngame()) {
+    ++m_OverlayProcessFrames;
+    // `IsIngame()` is not a reliable gate here: this BML build returns false in
+    // the menu and, on custom maps, can stay false inside the level.  A ball is
+    // the honest signal: without one there is nothing to annotate.
+    CK3dEntity *ball = FindActiveBall();
+    if (!ball) {
         return;
     }
     // While the game is paused its own menu is on screen.  BML submits the whole
@@ -60,11 +66,24 @@ void FlexGravityMod::OnRender(CK_RENDER_FLAGS flags) {
     // nothing drawn here can ever go *below* that menu; hiding the overlay while
     // paused is what keeps it from covering the menu instead.
     if (m_BML->IsPaused()) {
+        ++m_OverlayPaused;
+        if (!m_OverlayGateWarned && ++m_OverlayGateFrames >= 120) {
+            m_OverlayGateWarned = true;
+            LogAlways("overlay: not drawn for %d frames (paused, noContext=%d)",
+                      m_OverlayGateFrames, m_OverlayNoContext);
+        }
         return;
     }
     if (!Bui::GetImGuiContext()) {
+        ++m_OverlayNoContext;
+        if (!m_OverlayGateWarned && ++m_OverlayGateFrames >= 120) {
+            m_OverlayGateWarned = true;
+            LogAlways("overlay: not drawn for %d frames (no ImGui context; paused=%d)",
+                      m_OverlayGateFrames, m_OverlayPaused);
+        }
         return;
     }
+    ++m_OverlayGateFrames;
     Bui::ImGuiContextScope contextScope;
     DrawOverlay();
 }
@@ -87,7 +106,14 @@ void FlexGravityMod::DrawOverlay() {
     m_OverlayContextWidth = renderContext->GetWidth();
     m_OverlayContextHeight = renderContext->GetHeight();
     if (m_OverlayContextWidth <= 0 || m_OverlayContextHeight <= 0) {
-        return;
+        // Some render engines report a zero context size here; the ImGui
+        // display size is still correct, and giving up would silently hide the
+        // whole overlay.
+        m_OverlayContextWidth = static_cast<int>(io.DisplaySize.x);
+        m_OverlayContextHeight = static_cast<int>(io.DisplaySize.y);
+        if (m_OverlayContextWidth <= 0 || m_OverlayContextHeight <= 0) {
+            return;
+        }
     }
 
     // The foreground list is the one BML definitely submits for mod drawing.
@@ -120,6 +146,18 @@ void FlexGravityMod::DrawOverlay() {
     // Exactly what the two overlays added to the draw list.  Everything else in
     // this function is the arrow, which is a handful of quads.
     m_OverlayVertices = draw->VtxBuffer.Size - verticesBefore;
+
+    // One-shot diagnostic for "the switch is on but nothing appears": the
+    // overlay ran, yet the arrow never produced a draw.  LogAlways ignores the
+    // log switches so this reaches ModLoader.log on a normal install.
+    if (m_ShowGVector && m_OverlayDrawn == 0 && m_OverlayFrames >= 120 && !m_OverlayDrawWarned) {
+        m_OverlayDrawWarned = true;
+        LogAlways("overlay: DrawOverlay runs but the arrow never drew (frames=%d noBall=%d "
+                  "noProjection=%d hidden=%d display=%.0fx%.0f context=%dx%d)",
+                  m_OverlayFrames, m_OverlayNoBall, m_OverlayNoProjection, m_OverlayHidden,
+                  m_OverlayDisplayWidth, m_OverlayDisplayHeight, m_OverlayContextWidth,
+                  m_OverlayContextHeight);
+    }
 
     // Periodic self-check: the batch projection must land on the same pixels as
     // the single-point call, otherwise the overlays would drift against the game
@@ -206,7 +244,6 @@ void FlexGravityMod::DrawGravityArrow(ImDrawList *draw, CKRenderContext *renderC
     CK3dEntity *ball = FindActiveBall();
     if (!ball) {
         ++m_OverlayNoBall;
-        DrawOverlayStatus(draw, renderContext);
         return;
     }
 
@@ -214,14 +251,47 @@ void FlexGravityMod::DrawGravityArrow(ImDrawList *draw, CKRenderContext *renderC
     const VxVector acceleration = SampleFieldAtPoint(centre);
     m_OverlayBall = centre;
     m_OverlayGravity = acceleration;
+    const float magnitude = std::sqrt(LengthSquared(acceleration));
+
+    // Screen-space anchor for the magnitude label.  It is also the only thing
+    // drawn when the arrow cannot be drawn (zero field) or is completely hidden
+    // behind the ball.
+    const ImGuiIO &io = ImGui::GetIO();
+    const float scaleX = m_OverlayContextWidth > 0
+                                 ? io.DisplaySize.x / static_cast<float>(m_OverlayContextWidth)
+                                 : 1.0f;
+    const float scaleY = m_OverlayContextHeight > 0
+                                 ? io.DisplaySize.y / static_cast<float>(m_OverlayContextHeight)
+                                 : 1.0f;
+    VxVector ballScreenPoint;
+    bool ballOnScreen = false;
+    {
+        const VxMatrix inverseBall = ball->GetInverseWorldMatrix();
+        ballOnScreen = ProjectToScreen(renderContext, inverseBall * centre, ball, ballScreenPoint);
+    }
+    const ImVec2 ballScreen(ballScreenPoint.x * scaleX, ballScreenPoint.y * scaleY);
+    char label[64] = {};
+    std::snprintf(label, sizeof(label), "g=%.4f", magnitude);
+    const auto drawLabelAtBall = [&]() {
+        if (!ballOnScreen) {
+            return;
+        }
+        const ImVec2 textSize = ImGui::CalcTextSize(label);
+        AddShadowedText(draw,
+                        ImVec2(ballScreen.x - textSize.x * 0.5f,
+                               ballScreen.y - textSize.y * 0.5f),
+                        label);
+    };
 
     VxVector direction(0.0f, 0.0f, 0.0f);
     if (!Normalize(acceleration, direction)) {
-        ++m_OverlayNoProjection;
-        DrawOverlayStatus(draw, renderContext);
+        // Zero field: no arrow and no debug block, just g=0.0000 at the ball.
+        drawLabelAtBall();
+        if (ballOnScreen) {
+            ++m_OverlayDrawn;
+        }
         return;
     }
-    const float magnitude = std::sqrt(LengthSquared(acceleration));
 
     const float radius = BallRadiusFor(ball);
     m_OverlayBallRadius = radius;
@@ -314,8 +384,13 @@ void FlexGravityMod::DrawGravityArrow(ImDrawList *draw, CKRenderContext *renderC
     m_OverlayVisibleMetres = visibleMetres;
     m_OverlaySpanCount = spanCount;
     if (spanCount == 0) {
-        // Completely hidden behind the ball: correct for a near top-down view.
+        // Completely hidden behind the ball: draw only the magnitude label.
+        // The user explicitly asked for no arrow in this case.
         ++m_OverlayHidden;
+        drawLabelAtBall();
+        if (ballOnScreen) {
+            ++m_OverlayDrawn;
+        }
         return;
     }
 
@@ -333,10 +408,6 @@ void FlexGravityMod::DrawGravityArrow(ImDrawList *draw, CKRenderContext *renderC
         out = ImVec2(screen.x, screen.y);
         return true;
     };
-
-    const ImGuiIO &io = ImGui::GetIO();
-    const float scaleX = io.DisplaySize.x / static_cast<float>(renderContext->GetWidth());
-    const float scaleY = io.DisplaySize.y / static_cast<float>(renderContext->GetHeight());
 
     // Pixels per metre at the arrow's depth: project the midpoint and the same
     // point one metre to the side of the view direction.  That is the true
@@ -450,39 +521,16 @@ void FlexGravityMod::DrawGravityArrow(ImDrawList *draw, CKRenderContext *renderC
     ++m_OverlayDrawn;
 
     if (!drewTip) {
-        // The tip is hidden behind the ball, so there is no point to hang the
-        // magnitude label on: the arrow visibly runs into the ball instead.
+        // The arrow runs into the ball before its head; keep the magnitude
+        // readable at the ball instead of dropping it.
+        drawLabelAtBall();
         return;
     }
 
-    char label[64];
-    std::snprintf(label, sizeof(label), "g=%.4f", magnitude);
     const ImVec2 textSize = ImGui::CalcTextSize(label);
     const ImVec2 textCentre(tipScreen.x + tipAxis.x * 16.0f, tipScreen.y + tipAxis.y * 16.0f);
     AddShadowedText(draw,
                     ImVec2(textCentre.x - textSize.x * 0.5f, textCentre.y - textSize.y * 0.5f), label);
-}
-
-// Shown only when the arrow cannot be drawn at all: it tells the three things
-// that can fail (no ball, no gravity, projection) apart at a glance, and also
-// proves that the ImGui draw list itself is live.
-void FlexGravityMod::DrawOverlayStatus(ImDrawList *draw, CKRenderContext *renderContext) {
-    char line[192];
-    std::snprintf(line, sizeof(line), "FlexGravity overlay: frames=%d drawn=%d noball=%d noproj=%d",
-                  m_OverlayFrames, m_OverlayDrawn, m_OverlayNoBall, m_OverlayNoProjection);
-    AddShadowedText(draw, ImVec2(16.0f, 16.0f), line);
-
-    std::snprintf(line, sizeof(line), "ball=(%.1f,%.1f,%.1f) g=(%.1f,%.1f,%.1f)",
-                  m_OverlayBall.x, m_OverlayBall.y, m_OverlayBall.z, m_OverlayGravity.x,
-                  m_OverlayGravity.y, m_OverlayGravity.z);
-    AddShadowedText(draw, ImVec2(16.0f, 34.0f), line);
-
-    std::snprintf(line, sizeof(line), "base=(%.1f,%.1f) tip=(%.1f,%.1f) display=%.0fx%.0f rc=%dx%d",
-                  m_OverlayBase.x, m_OverlayBase.y, m_OverlayTip.x, m_OverlayTip.y,
-                  m_OverlayDisplayWidth, m_OverlayDisplayHeight,
-                  renderContext ? renderContext->GetWidth() : 0,
-                  renderContext ? renderContext->GetHeight() : 0);
-    AddShadowedText(draw, ImVec2(16.0f, 52.0f), line);
 }
 
 bool FlexGravityMod::ProjectToScreen(CKRenderContext *renderContext, const VxVector &localPoint,
@@ -531,6 +579,9 @@ void FlexGravityMod::PrintVizStatus(IBML *bml) {
     LogInfo("Overlay: hadFrame=%s frames=%d drawn=%d noBall=%d noProjection=%d hidden=%d",
             BoolText(m_OverlayHadFrame).c_str(), m_OverlayFrames, m_OverlayDrawn, m_OverlayNoBall,
             m_OverlayNoProjection, m_OverlayHidden);
+    LogInfo("Overlay gate: paused=%d noContext=%d gateFrames=%d warned=%s processFrames=%d",
+            m_OverlayPaused, m_OverlayNoContext, m_OverlayGateFrames,
+            BoolText(m_OverlayGateWarned).c_str(), m_OverlayProcessFrames);
     LogInfo("Overlay: imguiContext=%p bmlContext=%p display=%.0fx%.0f renderContext=%dx%d",
             static_cast<void *>(ImGui::GetCurrentContext()),
             static_cast<void *>(Bui::GetImGuiContext()), m_OverlayDisplayWidth,

@@ -39,6 +39,14 @@ void FlexGravityMod::OnUnload() {
 void FlexGravityMod::OnStartLevel() {
     m_TearingDown = false;
 
+    // Overlay diagnostics are per level: a warning written in the menu must not
+    // suppress the one that would explain a missing arrow in the level.
+    m_OverlayGateWarned = false;
+    m_OverlayDrawWarned = false;
+    m_OverlayGateFrames = 0;
+    m_OverlayProcessFrames = 0;
+    m_OverlayHadFrame = false;
+
     CKBehavior *levelInit = m_BML ? m_BML->GetScriptByName("Level_Init") : nullptr;
     if (!m_ForceChannels.empty()) {
         if (levelInit && levelInit == m_OwnerScript) {
@@ -103,6 +111,10 @@ void FlexGravityMod::OnProcess() {
         UpdateFields();
     }
     FlushLogCounters();
+    // ImGui frame order in BML 0.3.13: PreProcess(NewFrame) -> PostProcess
+    // (this callback) -> ImGui::Render().  Drawing here is inside the frame;
+    // OnRender runs after Render and its draw commands are discarded.
+    DrawOverlayFrame();
 }
 
 void FlexGravityMod::OnPhysicalize(CK3dEntity *target, CKBOOL fixed, float friction, float elasticity, float mass,

@@ -1,4 +1,4 @@
-﻿#include "mod/FlexGravityMod.h"
+#include "mod/FlexGravityMod.h"
 
 namespace fg::vt {
 
@@ -85,6 +85,74 @@ int SafeCurveIsOpen(CKCurve *curve) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 1;
     }
+}
+
+namespace {
+
+bool HasPlaceholderPrefixBytes(const std::string &raw) {
+    return raw.size() >= 3 && static_cast<unsigned char>(raw[0]) == 0x01 && raw[1] == '_' &&
+           raw[2] == '_';
+}
+
+// Object names come from the Virtools object table in the system ANSI/GBK code
+// page; the log is UTF-8.  ASCII names pass through unchanged.
+std::string AnsiToUtf8(const std::string &input) {
+    if (input.empty()) {
+        return input;
+    }
+    const int length = static_cast<int>(input.size());
+    const int wideLength = MultiByteToWideChar(CP_ACP, 0, input.c_str(), length, nullptr, 0);
+    if (wideLength <= 0) {
+        return input;
+    }
+    std::wstring wide(static_cast<size_t>(wideLength), L'\0');
+    if (MultiByteToWideChar(CP_ACP, 0, input.c_str(), length, &wide[0], wideLength) <= 0) {
+        return input;
+    }
+    const int utf8Length =
+            WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), wideLength, nullptr, 0, nullptr, nullptr);
+    if (utf8Length <= 0) {
+        return input;
+    }
+    std::string out(static_cast<size_t>(utf8Length), '\0');
+    if (WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), wideLength, &out[0], utf8Length, nullptr,
+                            nullptr) <= 0) {
+        return input;
+    }
+    return out;
+}
+
+std::string SanitizeControlBytes(const std::string &text) {
+    std::string out = text;
+    for (char &c : out) {
+        const unsigned char value = static_cast<unsigned char>(c);
+        if (value < 0x20 && value != '\t') {
+            c = '?';
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+bool HasPlaceholderPrefix(const std::string &raw) {
+    return HasPlaceholderPrefixBytes(raw);
+}
+
+std::string StripPlaceholderPrefix(const std::string &raw) {
+    return HasPlaceholderPrefixBytes(raw) ? raw.substr(3) : raw;
+}
+
+std::string DisplayName(const std::string &raw) {
+    return SanitizeControlBytes(AnsiToUtf8(StripPlaceholderPrefix(raw)));
+}
+
+std::string DisplayObjectName(CKObject *object) {
+    if (!object) {
+        return "<null>";
+    }
+    CKSTRING name = object->GetName();
+    return name && *name ? DisplayName(std::string(name)) : std::string("<unnamed>");
 }
 
 } // namespace fg::vt

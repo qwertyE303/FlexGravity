@@ -77,7 +77,7 @@ void FlexGravityMod::OnLoad() {
     // themselves, so turning it on/off takes effect immediately.
     m_BML->RegisterCommand(new FlexGravityCommand(this));
 
-    m_BML->SendIngameMessage("FlexGravity " FLEXGRAVITY_VERSION " loaded.");
+    // Deliberately no ingame popup on load: the mod is meant to be silent.
     LogInfo("FlexGravity %s loaded; DebugMode=%s EnableLog=%s, overlay: gvector=%s lines=%s (density %g) "
             "equipotentials=%s (density %g) distance=%g, console: fg debug <command>",
             FLEXGRAVITY_VERSION, m_DebugMode ? "on" : "off", m_EnableLog ? "on" : "off",

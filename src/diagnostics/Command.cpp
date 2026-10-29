@@ -10,6 +10,7 @@ enum class DebugAction {
     Custom,
     Expr,
     Domain,
+    FreeMode,
     Reload,
     Help
 };
@@ -29,7 +30,8 @@ constexpr DebugCommand kDebugCommands[] = {
         {"viz", "viz", DebugAction::Viz},
         {"custom", "custom [at x y z]", DebugAction::Custom},
         {"expr", "expr [at x y z] <expr>", DebugAction::Expr},
-        {"domain", "domain [at x y z] <relations>", DebugAction::Domain},
+        {"domain", "domain [at x y z] <expression>", DebugAction::Domain},
+        {"freemode", "freemode 0|1|true|false", DebugAction::FreeMode},
         {"reload", "reload", DebugAction::Reload},
         {"help", "help", DebugAction::Help},
 };
@@ -234,6 +236,25 @@ void FlexGravityCommand::Execute(IBML *bml, const std::vector<std::string> &args
                 m_Mod->PrintExpressionProbe(bml, hasPoint, point, text);
             } else {
                 m_Mod->PrintDomainProbe(bml, hasPoint, point, text);
+            }
+            break;
+        }
+        case DebugAction::FreeMode: {
+            if (subArgs.size() < 3) {
+                bml->SendIngameMessage(
+                        ("FlexGravity: usage: fg debug freemode 0|1|true|false (currently " +
+                         std::string(m_Mod->FreeModeEnabled() ? "on" : "off") + ")")
+                                .c_str());
+                break;
+            }
+            const std::string value = Lowercase(subArgs[2]);
+            if (value == "1" || value == "true") {
+                m_Mod->SetFreeMode(bml, true);
+            } else if (value == "0" || value == "false") {
+                m_Mod->SetFreeMode(bml, false);
+            } else {
+                bml->SendIngameMessage(
+                        "FlexGravity: freemode expects 0, 1, true or false.");
             }
             break;
         }

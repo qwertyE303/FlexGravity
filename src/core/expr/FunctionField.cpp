@@ -24,11 +24,14 @@ double Clamp(double value, double low, double high) {
     return value > high ? high : value;
 }
 
-Instruction ConstantZero() {
+Program ConstantZeroProgram() {
+    Program program;
     Instruction instruction;
     instruction.op = OpCode::PushNumber;
     instruction.number = 0.0;
-    return instruction;
+    program.code.push_back(instruction);
+    program.maxDepth = 1;
+    return program;
 }
 
 } // namespace
@@ -82,61 +85,41 @@ PointFrame MakePointFrame(const VxVector &worldPoint) {
     return frame;
 }
 
-void CompileCustomField(CustomFieldInfo &field) {
-    field.valid = false;
-    field.error.clear();
-    field.domain = Domain{};
-    field.hasDomain = false;
+void CompileCField(const std::string (&text)[6], int mode, CompiledCField &out) {
+    out = CompiledCField{};
+    out.mode = mode == 1 ? 1 : 0;
+    out.valid = true;
+    for (int column = 0; column < 6; ++column) {
+        out.text[column] = text[column];
+    }
 
-    const int group = field.mode == 1 ? 1 : 0;
-    const unsigned mask = kGroupMask[group];
-
+    const int group = out.mode;
     for (int component = 0; component < 3; ++component) {
-        const int column = group * 3 + component;
-        field.components[component] = Program{};
+        const std::string &source = text[group * 3 + component];
+        out.emptyComponent[component] = source.empty();
 
-        if (field.text[column].empty()) {
+        if (source.empty()) {
             // Defensive: an empty cell is 0, not a reason to reject the row.
-            field.components[component].code.push_back(ConstantZero());
-            field.components[component].maxDepth = 1;
+            out.components[component] = ConstantZeroProgram();
             continue;
         }
 
         CompileError error;
-        if (!CompileExpression(field.text[column], mask, field.components[component], error)) {
-            field.error = std::string(kGroupNames[group][component]) + ": " + error.message +
-                          " (byte " + std::to_string(error.position) + ")";
-            return;
+        Program program;
+        if (!CompileExpression(source, kGroupMask[group], program, error)) {
+            // The specification treats a bad component as 0 and keeps the row.
+            out.components[component] = ConstantZeroProgram();
+            if (out.error.empty()) {
+                out.error = std::string(kGroupNames[group][component]) + ": " + error.message +
+                            " (byte " + std::to_string(error.position) + ")";
+            }
+        } else {
+            out.components[component] = std::move(program);
         }
     }
-
-    field.hasDomain = !field.domainText.empty();
-    if (field.hasDomain) {
-        CompileError error;
-        if (!CompileDomain(field.domainText, field.domain, error)) {
-            field.error = "Domain: " + error.message + " (byte " + std::to_string(error.position) + ")";
-            return;
-        }
-    }
-
-    field.valid = true;
 }
 
-bool EvaluateCustomDomain(const CustomFieldInfo &field, const PointFrame &frame, bool *nonFinite) {
-    if (nonFinite) {
-        *nonFinite = false;
-    }
-    if (!field.valid) {
-        return false;
-    }
-    if (!field.hasDomain) {
-        return true;
-    }
-    return EvaluateDomain(field.domain, frame.variables, nonFinite);
-}
-
-VxVector EvaluateCustomComponents(const CustomFieldInfo &field, const PointFrame &frame,
-                                  bool *nonFinite) {
+VxVector EvaluateCField(const CompiledCField &field, const PointFrame &frame, bool *nonFinite) {
     if (nonFinite) {
         *nonFinite = false;
     }

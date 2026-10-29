@@ -20,7 +20,7 @@ struct BvhNode {
     int count = 0; // > 0 means a leaf holding triangles [start, start + count)
 };
 
-// A FG_U / FG_R region: the inside of the object's own closed mesh, expressed
+// A FG_UField / FG_Region region: the inside of the object's own closed mesh, expressed
 // in the object's local space.  When no usable mesh exists the local bounding
 // box is used instead.
 struct RegionVolume {

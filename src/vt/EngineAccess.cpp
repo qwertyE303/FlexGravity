@@ -6,7 +6,7 @@ void AppendWarning(core::ScanInfo &scan, const std::string &message) {
     scan.warnings.push_back(message);
 }
 
-// FG_Custom function cells are ASCII and the editor does not truncate them.  A
+// FG_CField function cells are ASCII and the editor does not truncate them.  A
 // cell larger than this is treated as corrupt instead of being copied.
 constexpr int kMaxCellStringBytes = 8192;
 
@@ -31,6 +31,23 @@ void FlexGravityMod::LogInfo(const char *fmt, ...) {
 
 void FlexGravityMod::LogWarn(const char *fmt, ...) {
     if (!m_BML || !LogEnabled()) {
+        return;
+    }
+    ILogger *logger = GetLogger();
+    if (!logger) {
+        return;
+    }
+
+    char buffer[2048] = {};
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+    logger->Warn("[FlexGravity] %s", buffer);
+}
+
+void FlexGravityMod::LogAlways(const char *fmt, ...) {
+    if (!m_BML) {
         return;
     }
     ILogger *logger = GetLogger();
@@ -218,14 +235,40 @@ CK3dEntity *FlexGravityMod::FindActiveBall() {
         return nullptr;
     }
     CKDataArray *currentLevel = m_BML->GetArrayByName("CurrentLevel");
-    if (!currentLevel) {
-        return nullptr;
+    if (currentLevel) {
+        const int column = FindColumn(currentLevel, "ActiveBall");
+        if (column >= 0) {
+            if (CK3dEntity *ball = CK3dEntity::Cast(currentLevel->GetElementObject(0, column))) {
+                return ball;
+            }
+        }
     }
-    const int column = FindColumn(currentLevel, "ActiveBall");
-    if (column < 0) {
-        return nullptr;
+
+    // Fallback: CurrentLevel/ActiveBall is the documented source, but if the
+    // array or column is missing the overlay would silently draw nothing.
+    // Prefer a physicalized body whose name starts with "Ball", then any body
+    // that was physicalized with a ball collider.
+    CK3dEntity *ballCollider = nullptr;
+    for (const auto &entry : m_Bodies) {
+        const BodyInfo &body = entry.second;
+        if (body.fixed || !body.physicalized) {
+            continue;
+        }
+        if (m_BallRadii.find(body.objectId) == m_BallRadii.end()) {
+            continue;
+        }
+        CK3dEntity *entity = ResolveEntity(body.objectId);
+        if (!entity) {
+            continue;
+        }
+        if (body.objectName.compare(0, 4, "Ball") == 0) {
+            return entity;
+        }
+        if (!ballCollider) {
+            ballCollider = entity;
+        }
     }
-    return CK3dEntity::Cast(currentLevel->GetElementObject(0, column));
+    return ballCollider;
 }
 
 // Mass is only known after OnPhysicalize; the fallback is the wood ball's mass

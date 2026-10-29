@@ -1,7 +1,7 @@
 #pragma once
 
-// One compiled FG_Custom row: three component programs plus a Domain, in world
-// space.  Engine-free, so the whole row can be compiled and evaluated in tests.
+// One compiled FG_CField row: three component programs in world space.
+// Engine-free, so the whole row can be compiled and evaluated in tests.
 
 #include <string>
 
@@ -27,30 +27,25 @@ struct PointFrame {
 //   phi   = asin(y / r)                         in [-pi/2, pi/2]
 PointFrame MakePointFrame(const VxVector &worldPoint);
 
-struct CustomFieldInfo {
+struct CompiledCField {
     std::string name;    // raw bytes from the DataArray (ANSI/GBK); logs only
     int mode = 0;        // 0 = rectangular, 1 = spherical
     std::string text[6]; // X, Y, Z, R, Theta, Phi exactly as authored
-    std::string domainText;
 
-    Program components[3]; // the three components of the active group
-    Domain domain;
-    bool valid = false;
-    bool hasDomain = false;
-    std::string error; // first compile problem, already formatted for the log
+    Program components[3];       // the three components of the active group
+    bool emptyComponent[3] = {false, false, false};
+    bool valid = false;          // the row itself; a bad component is just 0
+    std::string error;           // first compile problem, already formatted
 };
 
-// Compiles the active group and the Domain.  An empty component compiles to the
-// constant 0 (the caller warns about it); any real syntax error clears `valid`.
-void CompileCustomField(CustomFieldInfo &field);
-
-bool EvaluateCustomDomain(const CustomFieldInfo &field, const PointFrame &frame, bool *nonFinite);
+// Compiles the active group.  An empty component compiles to the constant 0 and
+// is reported through `emptyComponent`; a syntax error zeroes that component and
+// is reported in `error`, but never rejects the row (the specification treats a
+// bad component as 0).
+void CompileCField(const std::string (&text)[6], int mode, CompiledCField &out);
 
 // Acceleration of one row at the point.  A component that evaluates to NaN/Inf
-// is treated as 0 and reported through `nonFinite` (the specification's rule);
-// the spherical basis is applied after that, so a NaN can never leak into the
-// force.
-VxVector EvaluateCustomComponents(const CustomFieldInfo &field, const PointFrame &frame,
-                                  bool *nonFinite);
+// is treated as 0 and reported through `nonFinite`.
+VxVector EvaluateCField(const CompiledCField &field, const PointFrame &frame, bool *nonFinite);
 
 } // namespace fg::core::expr
