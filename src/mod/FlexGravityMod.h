@@ -536,6 +536,9 @@ private:
     VxVector m_OverlayBase = VxVector(0.0f, 0.0f, 0.0f);
     VxVector m_OverlayTip = VxVector(0.0f, 0.0f, 0.0f);
     float m_OverlayBallRadius = 0.0f;
+    // Where the overlay's ball radius came from ("reported" / "vanilla" /
+    // "localBox" / "default"), so `fg debug viz` can explain the arrow size.
+    const char *m_OverlayRadiusSource = "none";
     float m_OverlayPixelsPerMetre = 0.0f;
     float m_OverlayDisplayWidth = 0.0f;
     float m_OverlayDisplayHeight = 0.0f;

@@ -50,6 +50,12 @@ inline constexpr float kGravityArrowShaftTip = 0.065f;    // shaft radius where 
 inline constexpr float kGravityArrowHeadLength = 0.850f;  // head length
 inline constexpr float kGravityArrowHeadRadius = 0.300f;  // head half width
 
+// Below this projected length the arrow is not drawn at all: the overlay only
+// shows the magnitude at the ball, exactly like a zero field.  At 8000 world
+// units a 5 m arrow is about half a pixel, and a sub-pixel arrow is a smear
+// with no readable direction anyway.
+inline constexpr float kGravityArrowMinPixels = 1.0f;
+
 // Wood and stone balls are 4 m across (radius 2) and that radius is baked into
 // the level script; the engine reports it through OnPhysicalize.  This is only
 // the fallback for a ball that was never physicalized.

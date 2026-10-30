@@ -42,6 +42,25 @@ void AddShadowedText(ImDrawList *draw, const ImVec2 &position, const char *text)
     draw->AddText(position, kStatusColor, text);
 }
 
+// The three vanilla ball objects.  They are the only 4 m spheres the overlay can
+// meet, and their names are stable across levels and ball switches.  Matching is
+// by exact name or a '_' suffix: "Ball_Wood" and "Ball_Wood_01" are the ball,
+// "Ball_Wooden" is not.
+bool IsVanillaBallName(const std::string &name) {
+    static const char *const kNames[] = {"Ball_Wood",  "Ball_Stone",  "Ball_Paper",
+                                         "P_Ball_Wood", "P_Ball_Stone", "P_Ball_Paper"};
+    for (const char *candidate : kNames) {
+        const size_t length = std::strlen(candidate);
+        if (name.size() < length || name.compare(0, length, candidate) != 0) {
+            continue;
+        }
+        if (name.size() == length || name[length] == '_') {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 void FlexGravityMod::DrawOverlayFrame() {
@@ -213,25 +232,42 @@ VxMatrix FlexGravityMod::CameraWorldMatrix(CKRenderContext *renderContext) const
     return viewpoint->GetWorldMatrix();
 }
 
-// Radius of the ball in world units: the collision sphere the level script
-// hands to Physicalize, which for the 4 m balls is exactly the visual radius.
-// The bounding box is only a fallback, then the known default.
+// Radius of the ball in world units.  The collision sphere the level script hands
+// to Physicalize is authoritative, but it is only recorded for bodies that were
+// physicalized with a ball collider.  The three vanilla balls are 4 m spheres
+// (radius 2), so a missing report needs no measuring at all - measuring was the
+// bug: GetBoundingBox() is the *world* box, which changes as an irregular mesh
+// spins, and the paper ball is irregular enough that the arrow's tail (its start
+// and its occlusion radius) moved every frame while it rolled.
 float FlexGravityMod::BallRadiusFor(CK3dEntity *ball) {
     if (!ball) {
+        m_OverlayRadiusSource = "default";
         return core::kDefaultBallRadius;
     }
     const auto cached = m_BallRadii.find(ball->GetID());
     if (cached != m_BallRadii.end() && cached->second > 0.0f) {
+        m_OverlayRadiusSource = "reported";
         return cached->second;
     }
-    const VxBbox &box = ball->GetBoundingBox();
+    // Wood, stone and paper are all 4 m across; the level script bakes that radius
+    // into Physicalize, but the paper ball does not always report it.  Treat it
+    // exactly like the other two instead of deriving a radius from its mesh.
+    if (IsVanillaBallName(SafeName(ball))) {
+        m_OverlayRadiusSource = "vanilla";
+        return core::kDefaultBallRadius;
+    }
+    // Anything else (a custom ball type) falls back to the *local* box, which is
+    // rotation invariant.
+    const VxBbox &box = ball->GetBoundingBox(TRUE);
     if (box.IsValid()) {
         const VxVector half = box.GetHalfSize();
         const float smallest = (std::min)((std::min)(half.x, half.y), half.z);
         if (smallest > 0.05f) {
+            m_OverlayRadiusSource = "localBox";
             return smallest;
         }
     }
+    m_OverlayRadiusSource = "default";
     return core::kDefaultBallRadius;
 }
 
@@ -265,10 +301,12 @@ void FlexGravityMod::DrawGravityArrow(ImDrawList *draw, CKRenderContext *renderC
                                  : 1.0f;
     VxVector ballScreenPoint;
     bool ballOnScreen = false;
-    {
-        const VxMatrix inverseBall = ball->GetInverseWorldMatrix();
-        ballOnScreen = ProjectToScreen(renderContext, inverseBall * centre, ball, ballScreenPoint);
-    }
+    // Transform() treats Src as a point in the reference entity's local space, so
+    // the ball is passed as the reference and its inverse matrix maps world points
+    // back into that space.  Computed once: the projection checks below and the
+    // span drawing all need it.
+    const VxMatrix inverseBall = ball->GetInverseWorldMatrix();
+    ballOnScreen = ProjectToScreen(renderContext, inverseBall * centre, ball, ballScreenPoint);
     const ImVec2 ballScreen(ballScreenPoint.x * scaleX, ballScreenPoint.y * scaleY);
     char label[64] = {};
     std::snprintf(label, sizeof(label), "g=%.4f", magnitude);
@@ -301,6 +339,31 @@ void FlexGravityMod::DrawGravityArrow(ImDrawList *draw, CKRenderContext *renderC
     if (visibleLength <= 0.1f) {
         ++m_OverlayNoProjection;
         return;
+    }
+
+    // Below one pixel there is no arrow left to see, and a sub-pixel arrow also
+    // cannot convey a direction: show only the magnitude at the ball, exactly like
+    // the g = 0 branch above.  Doing this before the occlusion scan also skips a
+    // scan that could not produce a visible span at that size.
+    {
+        VxVector tailScreen;
+        VxVector tipScreen;
+        if (ProjectToScreen(renderContext, inverseBall * Add(centre, Scale(direction, tailT)), ball,
+                            tailScreen) &&
+            ProjectToScreen(renderContext, inverseBall * Add(centre, Scale(direction, tipT)), ball,
+                            tipScreen)) {
+            const float dx = (tipScreen.x - tailScreen.x) * scaleX;
+            const float dy = (tipScreen.y - tailScreen.y) * scaleY;
+            if (std::sqrt(dx * dx + dy * dy) < core::kGravityArrowMinPixels) {
+                m_OverlaySpanCount = 0;
+                m_OverlayVisibleMetres = 0.0f;
+                drawLabelAtBall();
+                if (ballOnScreen) {
+                    ++m_OverlayDrawn;
+                }
+                return;
+            }
+        }
     }
 
     // Is the ball between the camera and the point at distance t from the ball
@@ -394,11 +457,6 @@ void FlexGravityMod::DrawGravityArrow(ImDrawList *draw, CKRenderContext *renderC
         return;
     }
 
-    // Transform() treats Src as a point in the reference entity's local space,
-    // so the ball is passed as the reference and its inverse matrix maps world
-    // points back into that space.  The render context's world matrix, which
-    // the renderer owns, is never touched.
-    const VxMatrix inverseBall = ball->GetInverseWorldMatrix();
     const auto screenAt = [&](float t, ImVec2 &out) {
         VxVector screen;
         if (!ProjectToScreen(renderContext, inverseBall * Add(centre, Scale(direction, t)), ball,
@@ -589,9 +647,9 @@ void FlexGravityMod::PrintVizStatus(IBML *bml) {
     LogInfo("Overlay: ball=(%.2f,%.2f,%.2f) g=(%.2f,%.2f,%.2f) base=(%.2f,%.2f) tip=(%.2f,%.2f)",
             m_OverlayBall.x, m_OverlayBall.y, m_OverlayBall.z, m_OverlayGravity.x, m_OverlayGravity.y,
             m_OverlayGravity.z, m_OverlayBase.x, m_OverlayBase.y, m_OverlayTip.x, m_OverlayTip.y);
-    LogInfo("Overlay: ballRadius=%.3f pixelsPerMetre=%.3f arrowLength=%.3f spans=%d visible=%.3f",
-            m_OverlayBallRadius, m_OverlayPixelsPerMetre, core::kGravityArrowLength, m_OverlaySpanCount,
-            m_OverlayVisibleMetres);
+    LogInfo("Overlay: ballRadius=%.3f source=%s pixelsPerMetre=%.3f arrowLength=%.3f spans=%d visible=%.3f",
+            m_OverlayBallRadius, m_OverlayRadiusSource, m_OverlayPixelsPerMetre,
+            core::kGravityArrowLength, m_OverlaySpanCount, m_OverlayVisibleMetres);
     LogInfo("Overlay: vertices=%d budgets=%d+%d vtxOffset=%s",
             m_OverlayVertices, core::kFieldLineVertexBudget, core::kEquipotentialVertexBudget,
             BoolText(m_OverlayVtxOffsetSupported).c_str());
