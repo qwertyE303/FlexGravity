@@ -129,7 +129,13 @@ void FlexGravityMod::ApplyChannelForce(CK3dEntity *entity, const BodyInfo &body,
     const float rawValue = body.mass * magnitude / kForceScale;
     ScriptHelper::SetParamValue(forceParameter->GetDirectSource(), rawValue);
 
+#if defined(FLEXGRAVITY_LEGACY_BML)
+    // The legacy shim keeps one wake-up behavior per owner script, so it needs
+    // the script explicitly.
+    ExecuteBB::PhysicsWakeUp(m_OwnerScript, entity);
+#else
     ExecuteBB::PhysicsWakeUp(entity);
+#endif
     behavior->ActivateInput(0);
     behavior->Execute(0);
 

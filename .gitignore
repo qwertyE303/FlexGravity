@@ -9,6 +9,9 @@ build/
 *.exp
 *.lib
 
+*.bat
+bml-old/*.bat
+
 tests/
 bench/
 deps/

@@ -1,5 +1,9 @@
 #include "mod/FlexGravityMod.h"
 
+#if defined(FLEXGRAVITY_LEGACY_BML)
+#include "bml-old/BmlLegacyOverlay.h"
+#endif
+
 namespace {
 
 // BML+ only reports properties that the configuration file declares, so every
@@ -49,6 +53,9 @@ void FlexGravityMod::OnLoad() {
                    "Draw a blue arrow at the active ball: it points along the total gravity "
                    "(vanilla plus every active field) and is labelled with its magnitude.",
                    m_ShowGVector);
+#if !defined(FLEXGRAVITY_LEGACY_BML)
+        // Field lines and equipotential surfaces are BML+ only: the original
+        // loader build ships neither the code nor the configuration for them.
         ReadSwitch(config, "EnableFieldLines",
                    "Draw red gravity field lines around the camera, traced along the total "
                    "gravity and cached in world space as the ball moves.",
@@ -64,25 +71,43 @@ void FlexGravityMod::OnLoad() {
         ReadFloat(config, "EquipotentialDensity",
                   "Equipotential surfaces per distance x100, same scale as FieldLineDensity.",
                   10.0f, m_EquipotentialDensity);
-        ReadFloat(config, "DebugViewDistance",
+        ReadFloat(config, "OverlayViewDistance",
                   "Radius in world units of the sphere around the camera that the overlay draws in.",
                   100.0f, m_DebugViewDistance);
+#endif
     }
 
     // Logging starts here: LogInfo/LogWarn are gated by DebugMode && EnableLog,
     // and both are only known once the configuration above has been read.
+#if defined(FLEXGRAVITY_LEGACY_BML)
+    LogInfo("FlexGravity %s loading (BML %s, legacy overlay)", FLEXGRAVITY_VERSION, BML_VERSION);
+#else
     LogInfo("FlexGravity %s loading (BML+ %s)", FLEXGRAVITY_VERSION, BML_VERSION);
+#endif
 
     // The command is always registered; the debug subcommands check DebugMode
     // themselves, so turning it on/off takes effect immediately.
     m_BML->RegisterCommand(new FlexGravityCommand(this));
 
+#if defined(FLEXGRAVITY_LEGACY_BML)
+    // The original loader owns no ImGui context: create ours and register the
+    // post-sprite callback that submits the overlay.
+    BmlLegacyOverlayInitialize(m_BML);
+#endif
+
     // Deliberately no ingame popup on load: the mod is meant to be silent.
+#if defined(FLEXGRAVITY_LEGACY_BML)
+    LogInfo("FlexGravity %s loaded; DebugMode=%s EnableLog=%s, overlay: gvector=%s, "
+            "console: fg debug <command>",
+            FLEXGRAVITY_VERSION, m_DebugMode ? "on" : "off", m_EnableLog ? "on" : "off",
+            BoolText(m_ShowGVector).c_str());
+#else
     LogInfo("FlexGravity %s loaded; DebugMode=%s EnableLog=%s, overlay: gvector=%s lines=%s (density %g) "
             "equipotentials=%s (density %g) distance=%g, console: fg debug <command>",
             FLEXGRAVITY_VERSION, m_DebugMode ? "on" : "off", m_EnableLog ? "on" : "off",
             BoolText(m_ShowGVector).c_str(), BoolText(m_EnableFieldLines).c_str(), m_FieldLineDensity,
             BoolText(m_EnableEquipotentials).c_str(), m_EquipotentialDensity, m_DebugViewDistance);
+#endif
 }
 
 void FlexGravityMod::OnModifyConfig(const char *category, const char *key, IProperty *prop) {
@@ -120,6 +145,7 @@ void FlexGravityMod::OnModifyConfig(const char *category, const char *key, IProp
         noteSwitch("ShowGVector", m_ShowGVector);
         return;
     }
+#if !defined(FLEXGRAVITY_LEGACY_BML)
     if (_stricmp(key, "EnableFieldLines") == 0) {
         m_EnableFieldLines = prop->GetBoolean();
         noteSwitch("EnableFieldLines", m_EnableFieldLines);
@@ -140,10 +166,11 @@ void FlexGravityMod::OnModifyConfig(const char *category, const char *key, IProp
         noteFloat("EquipotentialDensity", m_EquipotentialDensity);
         return;
     }
-    if (_stricmp(key, "DebugViewDistance") == 0) {
+    if (_stricmp(key, "OverlayViewDistance") == 0) {
         m_DebugViewDistance = prop->GetFloat();
-        noteFloat("DebugViewDistance", m_DebugViewDistance);
+        noteFloat("OverlayViewDistance", m_DebugViewDistance);
     }
+#endif
 }
 
 MOD_EXPORT IMod *BMLEntry(IBML *bml) {

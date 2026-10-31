@@ -6,10 +6,15 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# BML+ 0.3.13 SDK and the Virtools 2.1 SDK are kept outside the source tree.
+# BML+ 0.3.12 SDK and the Virtools 2.1 SDK are kept outside the source tree.
 # Override these two paths on the command line if the layout changes.
-set(BML_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../deps/BMLPlus-SDK-v0.3.13-Release"
-        CACHE PATH "BML+ 0.3.13 SDK root")
+#
+# 0.3.12 is the declared loader floor: it is the oldest release that pins the
+# same Dear ImGui as 0.3.13 (v1.92.8), and every interface header this mod uses
+# is byte-identical between the two SDKs.  Compiling against 0.3.12 therefore
+# keeps the declared floor honest while still running on 0.3.13.
+set(BML_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../deps/BMLPlus-SDK-v0.3.12-Debug"
+        CACHE PATH "BML+ 0.3.12 SDK root")
 set(VT_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../deps/Virtools-SDK-2.1"
         CACHE PATH "Virtools 2.1 SDK root")
 
@@ -53,6 +58,7 @@ add_library(FlexGravity SHARED
         src/viz/FieldLines.cpp
         src/viz/FieldSampler.cpp
         src/viz/Overlay.cpp
+        src/viz/OverlayHostBmlPlus.cpp
         src/vt/EngineAccess.cpp
         src/vt/EngineBindings.cpp
         src/vt/ForceBackend.cpp

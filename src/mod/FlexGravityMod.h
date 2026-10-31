@@ -193,7 +193,18 @@ public:
         return "Map-authored gravity fields: uniform, monopole, line, sheet and custom "
                "expression fields.";
     }
-    DECLARE_BML_VERSION
+    // Declared loader floor, independent of the SDK this file compiles against
+    // (the loader rejects a mod that asks for more than it is).
+    //  * BML+ 0.3.12 is the oldest release that pins the same Dear ImGui as
+    //    0.3.13 (v1.92.8, commit 8936b58), so one .bmodp serves 0.3.12/0.3.13.
+    //    0.3.11 would work too, but 0.3.12 is the version we verify against.
+    //  * BML 0.3.40 is the oldest original loader whose IMod carries the
+    //    physicalize callbacks and whose headers still agree with 0.3.43.
+#if defined(FLEXGRAVITY_LEGACY_BML)
+    BMLVersion GetBMLVersion() override { return {0, 3, 40}; }
+#else
+    BMLVersion GetBMLVersion() override { return {0, 3, 12}; }
+#endif
 
     void OnLoad() override;
     void OnUnload() override;
@@ -203,6 +214,13 @@ public:
     void OnPreExitLevel() override;
 
     void OnProcess() override;
+#if defined(FLEXGRAVITY_LEGACY_BML)
+    // Fallback submission for the legacy overlay.  The normal path is the
+    // post-sprite callback registered by BmlLegacyOverlay; BML calls OnRender
+    // right after the render context finished the frame, so if the callback
+    // never fired the pending frame is submitted here instead.
+    void OnRender(CK_RENDER_FLAGS flags) override;
+#endif
     void OnModifyConfig(const char *category, const char *key, IProperty *prop) override;
 
     void OnPhysicalize(CK3dEntity *target, CKBOOL fixed, float friction, float elasticity, float mass,

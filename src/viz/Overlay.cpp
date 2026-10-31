@@ -1,6 +1,6 @@
 #include "mod/FlexGravityMod.h"
 
-#include <BML/Bui.h>
+#include "viz/OverlayHost.h"
 
 #include <imgui.h>
 
@@ -69,9 +69,17 @@ void FlexGravityMod::DrawOverlayFrame() {
     if (!m_DebugMode || m_TearingDown || !m_BML) {
         return;
     }
+#if defined(FLEXGRAVITY_LEGACY_BML)
+    // The original loader build has no field lines and no equipotential
+    // surfaces: the arrow is the whole overlay.
+    if (!m_ShowGVector) {
+        return;
+    }
+#else
     if (!m_ShowGVector && !m_EnableFieldLines && !m_EnableEquipotentials) {
         return;
     }
+#endif
     ++m_OverlayProcessFrames;
     // `IsIngame()` is not a reliable gate here: this BML build returns false in
     // the menu and, on custom maps, can stay false inside the level.  A ball is
@@ -93,7 +101,7 @@ void FlexGravityMod::DrawOverlayFrame() {
         }
         return;
     }
-    if (!Bui::GetImGuiContext()) {
+    if (!OverlayHost::HasContext()) {
         ++m_OverlayNoContext;
         if (!m_OverlayGateWarned && ++m_OverlayGateFrames >= 120) {
             m_OverlayGateWarned = true;
@@ -103,8 +111,12 @@ void FlexGravityMod::DrawOverlayFrame() {
         return;
     }
     ++m_OverlayGateFrames;
-    Bui::ImGuiContextScope contextScope;
+    OverlayHost::Scope contextScope;
+    if (!OverlayHost::BeginFrame()) {
+        return;
+    }
     DrawOverlay();
+    OverlayHost::EndFrame();
 }
 
 void FlexGravityMod::DrawOverlay() {
@@ -138,6 +150,7 @@ void FlexGravityMod::DrawOverlay() {
     // The foreground list is the one BML definitely submits for mod drawing.
     ImDrawList *draw = ImGui::GetForegroundDrawList();
     const int verticesBefore = draw->VtxBuffer.Size;
+#if !defined(FLEXGRAVITY_LEGACY_BML)
     if (m_EnableEquipotentials) {
         CK3dEntity *ball = FindActiveBall();
         if (ball) {
@@ -156,6 +169,7 @@ void FlexGravityMod::DrawOverlay() {
             DrawFieldLines(draw, renderContext, ball);
         }
     }
+#endif
     // The arrow has exactly one switch.  It used to be drawn whenever the field
     // lines were on, "as the reference the lines are read against", which made
     // turning ShowGVector off look broken while the lines were enabled.
@@ -641,9 +655,9 @@ void FlexGravityMod::PrintVizStatus(IBML *bml) {
             m_OverlayPaused, m_OverlayNoContext, m_OverlayGateFrames,
             BoolText(m_OverlayGateWarned).c_str(), m_OverlayProcessFrames);
     LogInfo("Overlay: imguiContext=%p bmlContext=%p display=%.0fx%.0f renderContext=%dx%d",
-            static_cast<void *>(ImGui::GetCurrentContext()),
-            static_cast<void *>(Bui::GetImGuiContext()), m_OverlayDisplayWidth,
-            m_OverlayDisplayHeight, m_OverlayContextWidth, m_OverlayContextHeight);
+            static_cast<void *>(ImGui::GetCurrentContext()), OverlayHost::CurrentContext(),
+            m_OverlayDisplayWidth, m_OverlayDisplayHeight, m_OverlayContextWidth,
+            m_OverlayContextHeight);
     LogInfo("Overlay: ball=(%.2f,%.2f,%.2f) g=(%.2f,%.2f,%.2f) base=(%.2f,%.2f) tip=(%.2f,%.2f)",
             m_OverlayBall.x, m_OverlayBall.y, m_OverlayBall.z, m_OverlayGravity.x, m_OverlayGravity.y,
             m_OverlayGravity.z, m_OverlayBase.x, m_OverlayBase.y, m_OverlayTip.x, m_OverlayTip.y);
@@ -655,6 +669,7 @@ void FlexGravityMod::PrintVizStatus(IBML *bml) {
             BoolText(m_OverlayVtxOffsetSupported).c_str());
     LogInfo("Overlay: batchProjection maxDeltaPx=%.4f (batch TransformVertices vs single Transform)",
             m_OverlayProjectionDelta);
+#if !defined(FLEXGRAVITY_LEGACY_BML)
     LogInfo("FieldLines: enabled=%s cached=%zu pending=%d traced=%d dropped=%d drawn=%d points=%d projected=%d vertices=%d lastTraceMs=%.2f spacing=%.3f cache=%s",
             BoolText(m_EnableFieldLines).c_str(), m_FieldLines.size(), m_FieldLinePending,
             m_FieldLineTraced, m_FieldLineDropped, m_FieldLineDrawn, m_FieldLinePoints,
@@ -666,6 +681,7 @@ void FlexGravityMod::PrintVizStatus(IBML *bml) {
             m_Equipotentials.levelStep, m_Equipotentials.cellSize, m_Equipotentials.lastBuildMs,
             m_Equipotentials.bandFirst, m_Equipotentials.bandLast, m_EqProjected,
             BoolText(m_EqCacheValid).c_str());
+#endif
 
     // The batch-vs-single projection check runs on the render thread (see
     // DrawOverlay); reading it here keeps the console path free of engine calls.

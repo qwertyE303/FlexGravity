@@ -1,5 +1,9 @@
 #include "mod/FlexGravityMod.h"
 
+#if defined(FLEXGRAVITY_LEGACY_BML)
+#include "bml-old/BmlLegacyOverlay.h"
+#endif
+
 // Every teardown callback funnels through here.  While the engine is tearing
 // the level down, no behavior may be executed and no force may be unset: doing
 // so collides with the engine destroying the rigid bodies and hangs the main
@@ -15,10 +19,17 @@ void FlexGravityMod::TearDownLevel(bool destroyChannels, bool clearScan) {
 
     m_Bodies.clear();
     m_BallRadii.clear();
+#if defined(FLEXGRAVITY_LEGACY_BML)
+    // No field-line/equipotential state exists on the original loader, but the
+    // cached wake-up behavior belongs to Level_Init and must be forgotten
+    // before the engine destroys that script.
+    ExecuteBB::ForgetCachedWakeUp();
+#else
     // Traced field lines only make sense for the level they were traced in, and
     // the equipotential lattice was sampled from that level's fields.
     DropFieldLines();
     DropEquipotentials();
+#endif
     m_PendingPhysicalizeCount = 0;
     m_PendingFixedCount = 0;
     m_PendingChannelsCreated = 0;
@@ -34,6 +45,10 @@ void FlexGravityMod::TearDownLevel(bool destroyChannels, bool clearScan) {
 
 void FlexGravityMod::OnUnload() {
     TearDownLevel(true, true);
+#if defined(FLEXGRAVITY_LEGACY_BML)
+    // Destroys the mod-owned ImGui context and unregisters the render callback.
+    BmlLegacyOverlayShutdown();
+#endif
 }
 
 void FlexGravityMod::OnStartLevel() {
@@ -98,6 +113,17 @@ void FlexGravityMod::OnPreExitLevel() {
     }
     TearDownLevel(true, true);
 }
+
+#if defined(FLEXGRAVITY_LEGACY_BML)
+void FlexGravityMod::OnRender(CK_RENDER_FLAGS flags) {
+    (void) flags;
+    static bool warned = false;
+    if (BmlLegacyOverlayFlushPending() && !warned) {
+        warned = true;
+        LogAlways("overlay: submitted from OnRender (the post-sprite callback did not fire)");
+    }
+}
+#endif
 
 void FlexGravityMod::OnProcess() {
     if (m_TearingDown) {
