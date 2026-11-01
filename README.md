@@ -19,6 +19,8 @@
 
 ## 配置
 
+### BML+
+
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | `DebugMode` | `0` | 下列调试功能、`fg debug` 命令的**总开关** |
@@ -29,6 +31,14 @@
 | `FieldLineDensity` | `10` | 重力场线密度 |
 | `EquipotentialDensity` | `10` | 等势面密度 |
 | `DebugViewDistance` | `100` | 覆盖层显示的视距 |
+
+### BML
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `DebugMode` | `0` | 下列调试功能、`fg debug` 命令的**总开关** |
+| `EnableLog` | `0` | 输出调试日志。 |
+| `ShowGVector` | `0` | 在球心生成蓝色箭头，显示玩家球所在点的实际重力方向，旁边标大小。 |
 
 ---
 
@@ -55,5 +65,5 @@ fg debug help
 
 ### /fg help
 
-帮助文档
+帮助
 

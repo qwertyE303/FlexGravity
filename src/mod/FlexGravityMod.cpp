@@ -36,44 +36,39 @@ bool ReadFloat(IConfig *config, const char *key, const char *comment, float defa
 void FlexGravityMod::OnLoad() {
     IConfig *config = GetConfig();
     if (config) {
-        config->SetCategoryComment("Debug", "FlexGravity diagnostics.");
+        config->SetCategoryComment("Debug", "Debug settings.");
         IProperty *debug = config->GetProperty("Debug", "DebugMode");
         if (debug) {
             debug->SetDefaultBoolean(false);
-            debug->SetComment("Master debug switch: overlay, debug commands and every diagnostic "
-                              "switch below only work while this is on.");
+            debug->SetComment("Master debug switch.");
             m_DebugMode = debug->GetBoolean();
         }
 
         // Debug overlay.  All of these live in Debug and default to off/safe.
         ReadSwitch(config, "EnableLog",
-                   "Write detailed diagnostics to ModLoader.log (requires DebugMode).",
+                   "Write detailed diagnostics to ModLoader.log",
                    m_EnableLog);
         ReadSwitch(config, "ShowGVector",
-                   "Draw a blue arrow at the active ball: it points along the total gravity "
-                   "(vanilla plus every active field) and is labelled with its magnitude.",
+                   "Draw a blue arrow at the active ball, showing the direction and the absolute value of total gravity.",
                    m_ShowGVector);
 #if !defined(FLEXGRAVITY_LEGACY_BML)
         // Field lines and equipotential surfaces are BML+ only: the original
         // loader build ships neither the code nor the configuration for them.
         ReadSwitch(config, "EnableFieldLines",
-                   "Draw red gravity field lines around the camera, traced along the total "
-                   "gravity and cached in world space as the ball moves.",
+                   "Draw red gravity field lines around the camera, traced along the total gravity.",
                    m_EnableFieldLines);
         ReadSwitch(config, "EnableEquipotentials",
-                   "Draw translucent yellow equipotential surfaces around the camera: shells of "
-                   "constant potential, one every EquipotentialDensity units.",
+                   "Draw translucent yellow equipotential surfaces around the camera.",
                    m_EnableEquipotentials);
         ReadFloat(config, "FieldLineDensity",
-                  "Field lines per distance x100: 100 means one line per unit at g = 20.  "
-                  "Spacing = (100 / density) * sqrt(20 / |g|).",
+                  "Density of field lines.",
                   10.0f, m_FieldLineDensity);
         ReadFloat(config, "EquipotentialDensity",
-                  "Equipotential surfaces per distance x100, same scale as FieldLineDensity.",
+                  "Density of equipotential surfaces.",
                   10.0f, m_EquipotentialDensity);
         ReadFloat(config, "OverlayViewDistance",
-                  "Radius in world units of the sphere around the camera that the overlay draws in.",
-                  100.0f, m_DebugViewDistance);
+                  "Radius of the sphere around the camera that the overlay draws in.",
+                  50.0f, m_DebugViewDistance);
 #endif
     }
 
