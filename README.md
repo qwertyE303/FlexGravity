@@ -30,7 +30,7 @@
 | `EnableEquipotentials` **（不完善，勿用）** | `0` | 显示半透明黄色等势面 |
 | `FieldLineDensity` | `10` | 重力场线密度 |
 | `EquipotentialDensity` | `10` | 等势面密度 |
-| `DebugViewDistance` | `100` | 覆盖层显示的视距 |
+| `DebugViewDistance` | `50` | 覆盖层显示的视距 |
 
 ### BML
 
